@@ -110,9 +110,23 @@ pub struct BftState {
     /// Vote sets for blocks (hash -> vote set).
     vote_sets: HashMap<Hash, VoteSet>,
 
-    /// Vote locking: tracks which block hash we voted for at each (height, round).
-    /// Critical for BFT safety - prevents voting for conflicting blocks.
-    voted_rounds: HashMap<(u64, u64), Hash>,
+    /// Vote locking: tracks which block hash we voted for at each height.
+    /// Critical for BFT safety - prevents voting for conflicting blocks at the same height,
+    /// even across different rounds. This is the core safety invariant of BFT consensus.
+    ///
+    /// Key: height, Value: (block_hash, round)
+    /// We also track the round to allow re-voting for the SAME block in a later round
+    /// (which is safe), while preventing votes for DIFFERENT blocks at the same height.
+    voted_heights: HashMap<u64, (Hash, u64)>,
+
+    /// Tracks which block each validator has voted for at each height.
+    /// Key: (height, validator_id), Value: block_hash
+    ///
+    /// This prevents Byzantine validators from voting for multiple blocks at the same height
+    /// across different VoteSets. When we receive a vote, we check if this validator
+    /// already voted for a DIFFERENT block at this height - if so, we reject the vote
+    /// and log the equivocation attempt.
+    received_votes_by_height: HashMap<(u64, ValidatorId), Hash>,
 
     /// Blocks that have been certified (have QC) but not yet committed.
     /// Maps block_hash -> (Block, QC).
@@ -187,7 +201,8 @@ impl BftState {
             genesis_block: None,
             pending_blocks: HashMap::new(),
             vote_sets: HashMap::new(),
-            voted_rounds: HashMap::new(),
+            voted_heights: HashMap::new(),
+            received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
             pending_vote_verifications: HashMap::new(),
             pending_qc_verifications: HashMap::new(),
@@ -371,17 +386,16 @@ impl BftState {
             return actions;
         }
 
-        // Check if we've already proposed/voted at this height/round.
-        // If we have, don't propose again - we're waiting for votes to collect.
+        // Check if we've already voted at this height.
+        // If we have, don't propose again - we're committed to that block.
         // Re-proposing would create a different block hash (due to timestamp)
-        // and split the votes, preventing quorum formation.
-        let vote_key = (next_height, round);
-        if self.voted_rounds.contains_key(&vote_key) {
+        // which we cannot vote for (vote locking).
+        if self.voted_heights.contains_key(&next_height) {
             trace!(
                 validator = ?self.validator_id(),
                 height = next_height,
                 round = round,
-                "Already proposed/voted at this height/round, skipping"
+                "Already voted at this height, skipping proposal"
             );
             return actions;
         }
@@ -928,28 +942,33 @@ impl BftState {
 
     /// Try to vote on a block after it's complete.
     fn try_vote_on_block(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
-        // Check vote locking - have we already voted for a different block at this (height, round)?
-        let vote_key = (height, round);
-        if let Some(&existing_hash) = self.voted_rounds.get(&vote_key) {
+        // Check vote locking - have we already voted for a block at this height?
+        // BFT Safety: A validator must NEVER vote for conflicting blocks at the same height,
+        // even across different rounds. This prevents equivocation attacks.
+        if let Some(&(existing_hash, existing_round)) = self.voted_heights.get(&height) {
             if existing_hash == block_hash {
-                // Already voted for this exact block
+                // Already voted for this exact block (possibly in an earlier round)
                 trace!(
                     validator = ?self.validator_id(),
                     block_hash = ?block_hash,
                     height = height,
                     round = round,
+                    existing_round = existing_round,
                     "Already voted for this block"
                 );
                 return vec![];
             } else {
                 // Would violate vote locking - this is a safety violation attempt
+                // This is CRITICAL: voting for different blocks at the same height
+                // enables equivocation attacks that can break BFT safety
                 warn!(
                     validator = ?self.validator_id(),
                     existing = ?existing_hash,
+                    existing_round = existing_round,
                     new = ?block_hash,
+                    new_round = round,
                     height = height,
-                    round = round,
-                    "Vote locking: already voted for different block"
+                    "Vote locking violation: already voted for different block at this height"
                 );
                 return vec![];
             }
@@ -1072,8 +1091,10 @@ impl BftState {
 
     /// Create a vote for a block.
     fn create_vote(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
-        // Record that we voted for this block
-        self.voted_rounds.insert((height, round), block_hash);
+        // Record that we voted for this block at this height
+        // This is the core safety invariant: once we vote for a block at a height,
+        // we can never vote for a different block at that height
+        self.voted_heights.insert(height, (block_hash, round));
 
         // Create signature
         let signature = self.signing_key.sign(block_hash.as_bytes());
@@ -1213,6 +1234,27 @@ impl BftState {
             return vec![];
         }
 
+        // Check for equivocation: has this validator voted for a DIFFERENT block at this height?
+        // This is critical for BFT safety - a validator must not vote for conflicting blocks.
+        let vote_key = (height, vote.voter);
+        if let Some(&existing_block) = self.received_votes_by_height.get(&vote_key) {
+            if existing_block != block_hash {
+                // EQUIVOCATION DETECTED: This validator voted for different blocks at the same height!
+                // This is Byzantine behavior. Log it and reject the vote.
+                warn!(
+                    voter = ?vote.voter,
+                    height = height,
+                    existing_block = ?existing_block,
+                    new_block = ?block_hash,
+                    "EQUIVOCATION DETECTED: validator voted for different blocks at same height"
+                );
+                // TODO: In a production system, we might want to generate an equivocation proof
+                // that can be used to slash the Byzantine validator's stake.
+                return vec![];
+            }
+            // Same block - this is a duplicate vote, VoteSet will handle it
+        }
+
         // Pre-compute topology values before mutable borrows
         let committee_size = self.committee().len();
         let total_power = self.total_voting_power();
@@ -1222,6 +1264,9 @@ impl BftState {
             .get(&block_hash)
             .map(|pb| pb.header().clone());
 
+        // Record that this validator voted for this block at this height
+        self.received_votes_by_height.insert(vote_key, block_hash);
+
         // Get or create vote set
         let vote_set = self
             .vote_sets
@@ -1230,7 +1275,7 @@ impl BftState {
 
         // Add vote to set
         if !vote_set.add_vote(pending.vote, pending.committee_index, pending.voting_power) {
-            // Duplicate vote
+            // Duplicate vote within same VoteSet
             return vec![];
         }
 
@@ -1761,14 +1806,16 @@ impl BftState {
 
         // Check if we're the new proposer for this height/round
         if self.should_propose(height, new_round) {
-            // Check if we've already proposed/voted at this height/round
-            let vote_key = (height, new_round);
-            if self.voted_rounds.contains_key(&vote_key) {
+            // Check if we've already voted at this height - if so, we're locked to that block
+            // and cannot propose a different one (vote locking safety)
+            if let Some(&(existing_hash, existing_round)) = self.voted_heights.get(&height) {
                 debug!(
                     validator = ?self.validator_id(),
                     height = height,
-                    round = new_round,
-                    "Already voted at this height/round, not proposing fallback"
+                    existing_round = existing_round,
+                    new_round = new_round,
+                    existing_block = ?existing_hash,
+                    "Already voted at this height, cannot propose fallback (vote locked)"
                 );
                 return vec![Action::SetTimer {
                     id: TimerId::Proposal,
@@ -1868,8 +1915,12 @@ impl BftState {
         self.vote_sets
             .retain(|_hash, vote_set| vote_set.height().is_none_or(|h| h > committed_height));
 
-        // Remove old voted_rounds entries
-        self.voted_rounds
+        // Remove old voted_heights entries
+        self.voted_heights
+            .retain(|height, _| *height > committed_height);
+
+        // Remove old received_votes_by_height entries
+        self.received_votes_by_height
             .retain(|(height, _), _| *height > committed_height);
 
         // Remove certified blocks at or below committed height
@@ -2719,5 +2770,322 @@ mod tests {
         };
         let block = make_test_block(10, vec![], vec![abort], vec![]);
         assert!(state.validate_deferrals_and_aborts(&block).is_ok());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Vote Locking Safety Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Helper to create a state with multiple validators for vote testing
+    fn make_multi_validator_state() -> (BftState, Vec<KeyPair>) {
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let state = BftState::new(0, keys[0].clone(), topology, BftConfig::default());
+        (state, keys)
+    }
+
+    #[test]
+    fn test_vote_locking_prevents_voting_for_different_block_at_same_height() {
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 1u64;
+        let round_0 = 0u64;
+        let round_1 = 1u64;
+
+        // Create two different blocks at the same height
+        let block_a = BlockHeader {
+            height: BlockHeight(height),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(1),
+            timestamp: 100_000,
+            round: round_0,
+            is_fallback: false,
+        };
+        let block_a_hash = block_a.hash();
+
+        let block_b = BlockHeader {
+            height: BlockHeight(height),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(2),
+            timestamp: 100_001, // Different timestamp = different hash
+            round: round_1,
+            is_fallback: false,
+        };
+        let block_b_hash = block_b.hash();
+
+        // Vote for block A at height 1, round 0
+        let actions = state.try_vote_on_block(block_a_hash, height, round_0);
+        assert!(
+            !actions.is_empty(),
+            "Should be able to vote for first block"
+        );
+
+        // Verify we recorded the vote
+        assert!(state.voted_heights.contains_key(&height));
+        assert_eq!(state.voted_heights.get(&height).unwrap().0, block_a_hash);
+
+        // Try to vote for block B at height 1, round 1 (different block, same height)
+        // This should be REJECTED due to vote locking
+        let actions = state.try_vote_on_block(block_b_hash, height, round_1);
+        assert!(
+            actions.is_empty(),
+            "Vote locking should prevent voting for different block at same height"
+        );
+
+        // Verify we're still locked to block A
+        assert_eq!(state.voted_heights.get(&height).unwrap().0, block_a_hash);
+    }
+
+    #[test]
+    fn test_vote_locking_allows_revoting_same_block() {
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 1u64;
+        let block = BlockHeader {
+            height: BlockHeight(height),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(1),
+            timestamp: 100_000,
+            round: 0,
+            is_fallback: false,
+        };
+        let block_hash = block.hash();
+
+        // Vote for block at round 0
+        let actions = state.try_vote_on_block(block_hash, height, 0);
+        assert!(!actions.is_empty(), "Should vote for block");
+
+        // Try to vote for SAME block at round 1 (after view change)
+        // This should return empty (already voted) but NOT log a warning
+        let actions = state.try_vote_on_block(block_hash, height, 1);
+        assert!(
+            actions.is_empty(),
+            "Should not re-broadcast vote for same block"
+        );
+
+        // But we should still be locked to the block
+        assert_eq!(state.voted_heights.get(&height).unwrap().0, block_hash);
+    }
+
+    #[test]
+    fn test_vote_locking_cleaned_up_on_commit() {
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Vote at heights 1, 2, 3
+        for height in 1..=3 {
+            let block = BlockHeader {
+                height: BlockHeight(height),
+                parent_hash: Hash::from_bytes(b"parent"),
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(1),
+                timestamp: 100_000,
+                round: 0,
+                is_fallback: false,
+            };
+            state.try_vote_on_block(block.hash(), height, 0);
+        }
+
+        assert_eq!(state.voted_heights.len(), 3);
+
+        // Simulate commit at height 2
+        state.cleanup_old_state(2);
+
+        // Only height 3 should remain
+        assert_eq!(state.voted_heights.len(), 1);
+        assert!(state.voted_heights.contains_key(&3));
+        assert!(!state.voted_heights.contains_key(&1));
+        assert!(!state.voted_heights.contains_key(&2));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Cross-VoteSet Equivocation Detection Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_equivocation_detection_rejects_conflicting_votes() {
+        let (mut state, keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 1u64;
+        let voter = ValidatorId(1);
+
+        // Create two different blocks at the same height
+        let block_a_hash = Hash::from_bytes(b"block_a_at_height_1");
+        let block_b_hash = Hash::from_bytes(b"block_b_at_height_1");
+
+        // Create vote for block A from validator 1
+        let vote_a = BlockVote {
+            block_hash: block_a_hash,
+            height: BlockHeight(height),
+            round: 0,
+            voter,
+            signature: keys[1].sign(block_a_hash.as_bytes()),
+            timestamp: 100_000,
+        };
+
+        // Create vote for block B from SAME validator 1 (equivocation!)
+        let vote_b = BlockVote {
+            block_hash: block_b_hash,
+            height: BlockHeight(height),
+            round: 1,
+            voter,
+            signature: keys[1].sign(block_b_hash.as_bytes()),
+            timestamp: 100_001,
+        };
+
+        // First, simulate successful signature verification for vote A
+        state.pending_vote_verifications.insert(
+            (block_a_hash, voter),
+            PendingVoteVerification {
+                vote: vote_a.clone(),
+                voting_power: 1,
+                committee_index: 1,
+            },
+        );
+        let _actions = state.on_vote_signature_verified(vote_a, true);
+        // Vote A should be accepted
+        assert!(
+            state
+                .received_votes_by_height
+                .contains_key(&(height, voter)),
+            "Vote A should be recorded"
+        );
+        assert_eq!(
+            state.received_votes_by_height.get(&(height, voter)),
+            Some(&block_a_hash)
+        );
+
+        // Now try to add vote B (equivocation attempt)
+        state.pending_vote_verifications.insert(
+            (block_b_hash, voter),
+            PendingVoteVerification {
+                vote: vote_b.clone(),
+                voting_power: 1,
+                committee_index: 1,
+            },
+        );
+        let actions = state.on_vote_signature_verified(vote_b, true);
+
+        // Vote B should be REJECTED (equivocation detected)
+        assert!(actions.is_empty(), "Equivocating vote should be rejected");
+
+        // We should still be tracking vote A
+        assert_eq!(
+            state.received_votes_by_height.get(&(height, voter)),
+            Some(&block_a_hash),
+            "Original vote should still be tracked"
+        );
+
+        // Vote set for block B should NOT have this vote
+        if let Some(vote_set) = state.vote_sets.get(&block_b_hash) {
+            assert_eq!(
+                vote_set.voting_power(),
+                0,
+                "Equivocating vote should not be added to vote set"
+            );
+        }
+    }
+
+    #[test]
+    fn test_equivocation_detection_allows_same_block_duplicate() {
+        let (mut state, keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 1u64;
+        let voter = ValidatorId(1);
+        let block_hash = Hash::from_bytes(b"block_at_height_1");
+
+        // Create two identical votes for the same block
+        let vote1 = BlockVote {
+            block_hash,
+            height: BlockHeight(height),
+            round: 0,
+            voter,
+            signature: keys[1].sign(block_hash.as_bytes()),
+            timestamp: 100_000,
+        };
+
+        let vote2 = BlockVote {
+            block_hash,
+            height: BlockHeight(height),
+            round: 0,
+            voter,
+            signature: keys[1].sign(block_hash.as_bytes()),
+            timestamp: 100_001, // Slightly different timestamp but same block
+        };
+
+        // Add first vote
+        state.pending_vote_verifications.insert(
+            (block_hash, voter),
+            PendingVoteVerification {
+                vote: vote1.clone(),
+                voting_power: 1,
+                committee_index: 1,
+            },
+        );
+        state.on_vote_signature_verified(vote1, true);
+
+        // Add second vote for same block - should not trigger equivocation warning
+        // (VoteSet will reject as duplicate, but equivocation check passes)
+        state.pending_vote_verifications.insert(
+            (block_hash, voter),
+            PendingVoteVerification {
+                vote: vote2.clone(),
+                voting_power: 1,
+                committee_index: 1,
+            },
+        );
+        let actions = state.on_vote_signature_verified(vote2, true);
+
+        // Actions should be empty (duplicate vote rejected by VoteSet)
+        assert!(actions.is_empty(), "Duplicate vote should be rejected");
+
+        // But we should still have the original vote tracked
+        assert_eq!(
+            state.received_votes_by_height.get(&(height, voter)),
+            Some(&block_hash)
+        );
+    }
+
+    #[test]
+    fn test_received_votes_cleaned_up_on_commit() {
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Record votes at heights 1, 2, 3 from different validators
+        for height in 1..=3u64 {
+            let voter = ValidatorId(height);
+            let block_hash = Hash::from_bytes(format!("block_{}", height).as_bytes());
+            state
+                .received_votes_by_height
+                .insert((height, voter), block_hash);
+        }
+
+        assert_eq!(state.received_votes_by_height.len(), 3);
+
+        // Commit at height 2
+        state.cleanup_old_state(2);
+
+        // Only height 3 votes should remain
+        assert_eq!(state.received_votes_by_height.len(), 1);
+        assert!(state
+            .received_votes_by_height
+            .contains_key(&(3, ValidatorId(3))));
     }
 }

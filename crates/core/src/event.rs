@@ -422,4 +422,69 @@ impl Event {
     pub fn is_client(&self) -> bool {
         self.priority() == EventPriority::Client
     }
+
+    /// Get the event type name for telemetry.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            // Timers
+            Event::ProposalTimer => "ProposalTimer",
+            Event::ViewChangeTimer => "ViewChangeTimer",
+            Event::CleanupTimer => "CleanupTimer",
+
+            // Network - BFT
+            Event::BlockHeaderReceived { .. } => "BlockHeaderReceived",
+            Event::BlockVoteReceived { .. } => "BlockVoteReceived",
+            Event::ViewChangeVoteReceived { .. } => "ViewChangeVoteReceived",
+            Event::ViewChangeCertificateReceived { .. } => "ViewChangeCertificateReceived",
+
+            // Network - Execution
+            Event::StateProvisionReceived { .. } => "StateProvisionReceived",
+            Event::StateVoteReceived { .. } => "StateVoteReceived",
+            Event::StateCertificateReceived { .. } => "StateCertificateReceived",
+
+            // Network - Mempool
+            Event::TransactionGossipReceived { .. } => "TransactionGossipReceived",
+
+            // Internal Events
+            Event::QuorumCertificateFormed { .. } => "QuorumCertificateFormed",
+            Event::BlockReadyToCommit { .. } => "BlockReadyToCommit",
+            Event::BlockCommitted { .. } => "BlockCommitted",
+            Event::TransactionAccepted { .. } => "TransactionAccepted",
+            Event::ViewChangeCompleted { .. } => "ViewChangeCompleted",
+            Event::TransactionFinalized { .. } => "TransactionFinalized",
+            Event::TransactionStatusChanged { .. } => "TransactionStatusChanged",
+
+            // Async Callbacks - Crypto Verification
+            Event::VoteSignatureVerified { .. } => "VoteSignatureVerified",
+            Event::ProvisionSignatureVerified { .. } => "ProvisionSignatureVerified",
+            Event::StateVoteSignatureVerified { .. } => "StateVoteSignatureVerified",
+            Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
+            Event::QcSignatureVerified { .. } => "QcSignatureVerified",
+            Event::ViewChangeVoteSignatureVerified { .. } => "ViewChangeVoteSignatureVerified",
+            Event::ViewChangeHighestQcVerified { .. } => "ViewChangeHighestQcVerified",
+            Event::ViewChangeCertificateSignatureVerified { .. } => {
+                "ViewChangeCertificateSignatureVerified"
+            }
+
+            // Async Callbacks - Execution
+            Event::TransactionsExecuted { .. } => "TransactionsExecuted",
+            Event::CrossShardTransactionExecuted { .. } => "CrossShardTransactionExecuted",
+            Event::MerkleRootComputed { .. } => "MerkleRootComputed",
+
+            // Storage Callbacks
+            Event::StateEntriesFetched { .. } => "StateEntriesFetched",
+            Event::BlockFetched { .. } => "BlockFetched",
+            Event::ChainMetadataFetched { .. } => "ChainMetadataFetched",
+
+            // Client Requests
+            Event::SubmitTransaction { .. } => "SubmitTransaction",
+            Event::QueryTransactionStatus { .. } => "QueryTransactionStatus",
+
+            // Sync Protocol
+            Event::SyncNeeded { .. } => "SyncNeeded",
+            Event::SyncBlockReceived { .. } => "SyncBlockReceived",
+            Event::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
+            Event::SyncComplete { .. } => "SyncComplete",
+        }
+    }
 }

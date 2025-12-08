@@ -9,6 +9,7 @@ use hyperscale_types::{
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use tracing::instrument;
 
 /// Lock contention statistics from the mempool.
 #[derive(Clone, Copy, Debug, Default)]
@@ -74,6 +75,7 @@ impl MempoolState {
     }
 
     /// Handle transaction submission from client.
+    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
     pub fn on_submit_transaction(
         &mut self,
         tx: RoutableTransaction,
@@ -109,7 +111,7 @@ impl MempoolState {
             // Broadcast to all validators globally so cross-shard TXs reach all shards
             Action::BroadcastGlobal {
                 message: OutboundMessage::TransactionGossip(Box::new(
-                    hyperscale_messages::TransactionGossip { transaction: tx },
+                    hyperscale_messages::TransactionGossip::new(tx),
                 )),
             },
             Action::EmitTransactionStatus {
@@ -122,6 +124,7 @@ impl MempoolState {
     }
 
     /// Handle transaction received via gossip.
+    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
     pub fn on_transaction_gossip(&mut self, tx: RoutableTransaction) -> Vec<Action> {
         let hash = tx.hash();
 
@@ -152,6 +155,10 @@ impl MempoolState {
     /// 2. Process deferrals → update status to Blocked
     /// 3. Process certificates → mark completed, trigger retries for blocked TXs
     /// 4. Process aborts → update status to terminal
+    #[instrument(skip(self, block), fields(
+        height = block.header.height.0,
+        tx_count = block.transactions.len()
+    ))]
     pub fn on_block_committed_full(&mut self, block: &Block) -> Vec<Action> {
         let height = block.header.height;
         let mut actions = Vec::new();
@@ -297,6 +304,7 @@ impl MempoolState {
     /// Mark a transaction as finalized (execution complete).
     ///
     /// Called when ExecutionState creates a TransactionCertificate.
+    #[instrument(skip(self), fields(tx_hash = ?tx_hash, accepted = accepted))]
     pub fn on_transaction_finalized(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
         if let Some(entry) = self.pool.get_mut(&tx_hash) {
             let decision = if accepted {

@@ -16,7 +16,7 @@ use hyperscale_types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::config::BftConfig;
 use crate::pending::PendingBlock;
@@ -423,6 +423,12 @@ impl BftState {
     /// Handle proposal timer - build and broadcast a new block.
     ///
     /// Takes ready transactions from mempool, plus deferrals, aborts, and certificates from execution.
+    #[instrument(skip(self, mempool, deferred, aborted, certificates), fields(
+        tx_count = mempool.len(),
+        deferred_count = deferred.len(),
+        aborted_count = aborted.len(),
+        cert_count = certificates.len()
+    ))]
     pub fn on_proposal_timer(
         &mut self,
         mempool: &[RoutableTransaction],
@@ -683,6 +689,12 @@ impl BftState {
     /// Sender identity comes from the header's proposer field (ValidatorId),
     /// which is signed and verified. For sync detection, we don't need
     /// the network peer ID.
+    #[instrument(skip(self, header, tx_hashes, cert_hashes, deferred, aborted, mempool), fields(
+        height = header.height.0,
+        round = header.round,
+        proposer = ?header.proposer,
+        tx_count = tx_hashes.len()
+    ))]
     pub fn on_block_header(
         &mut self,
         header: BlockHeader,
@@ -1239,6 +1251,11 @@ impl BftState {
     /// Note: The sender identity is not passed as a parameter anymore.
     /// Sender identity comes from vote.voter (ValidatorId), which is
     /// signed and verified.
+    #[instrument(skip(self, vote), fields(
+        height = vote.height.0,
+        voter = ?vote.voter,
+        block_hash = ?vote.block_hash
+    ))]
     pub fn on_block_vote(&mut self, vote: BlockVote) -> Vec<Action> {
         trace!(
             validator = ?self.validator_id(),
@@ -1322,6 +1339,11 @@ impl BftState {
     /// Handle vote signature verification result.
     ///
     /// Called when the runner completes `Action::VerifyVoteSignature`.
+    #[instrument(skip(self, vote), fields(
+        height = vote.height.0,
+        voter = ?vote.voter,
+        valid = valid
+    ))]
     pub fn on_vote_signature_verified(&mut self, vote: BlockVote, valid: bool) -> Vec<Action> {
         let block_hash = vote.block_hash;
         let height = vote.height.0;
@@ -1428,6 +1450,7 @@ impl BftState {
     ///
     /// Called when the runner completes `Action::VerifyQcSignature`.
     /// If valid, we proceed to vote on the block (for consensus) or apply the block (for sync).
+    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
     pub fn on_qc_signature_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
         // Check if this is a synced block verification
         if let Some(mut pending_sync) = self.pending_synced_block_verifications.remove(&block_hash)
@@ -1507,6 +1530,10 @@ impl BftState {
     /// Step 3 is critical for chain progress: without it, the chain would stall
     /// waiting for the next proposal timer, but the designated proposer for the
     /// next height might not know about this QC yet.
+    #[instrument(skip(self, qc, mempool, deferred, aborted, certificates), fields(
+        height = qc.height.0,
+        block_hash = ?block_hash
+    ))]
     pub fn on_qc_formed(
         &mut self,
         block_hash: Hash,
@@ -1580,6 +1607,10 @@ impl BftState {
     }
 
     /// Handle block ready to commit.
+    #[instrument(skip(self, qc), fields(
+        height = qc.height.0,
+        block_hash = ?block_hash
+    ))]
     pub fn on_block_ready_to_commit(
         &mut self,
         block_hash: Hash,
@@ -1683,6 +1714,10 @@ impl BftState {
     ///
     /// This is for blocks fetched via sync protocol, not blocks we participated
     /// in consensus for. We verify the QC signature before applying.
+    #[instrument(skip(self, block, qc), fields(
+        height = block.header.height.0,
+        block_hash = ?block.hash()
+    ))]
     pub fn on_synced_block_ready(&mut self, block: Block, qc: QuorumCertificate) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
@@ -1888,6 +1923,7 @@ impl BftState {
     /// 1. Update our view/round
     /// 2. If we're the new proposer, build and broadcast a fallback block
     /// 3. Otherwise, restart the proposal timer to wait for the new proposer
+    #[instrument(skip(self), fields(height = height, new_round = new_round))]
     pub fn on_view_change_completed(&mut self, height: u64, new_round: u64) -> Vec<Action> {
         // Only update if this is for our current height
         if height != self.committed_height + 1 {

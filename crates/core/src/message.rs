@@ -2,7 +2,8 @@
 
 use hyperscale_messages::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateGossip, StateProvisionGossip,
-    StateVoteBlockGossip, TransactionGossip, ViewChangeCertificateGossip, ViewChangeVoteGossip,
+    StateVoteBlockGossip, TraceContext, TransactionGossip, ViewChangeCertificateGossip,
+    ViewChangeVoteGossip,
 };
 
 /// Outbound network messages.
@@ -84,5 +85,37 @@ impl OutboundMessage {
     /// Check if this is a mempool message.
     pub fn is_mempool(&self) -> bool {
         matches!(self, OutboundMessage::TransactionGossip(_))
+    }
+
+    /// Inject trace context into cross-shard messages for distributed tracing.
+    ///
+    /// Only affects messages that carry trace context:
+    /// - `StateProvision` (cross-shard state)
+    /// - `StateCertificate` (cross-shard 2PC completion)
+    /// - `TransactionGossip` (transaction propagation)
+    ///
+    /// Other message types (BFT consensus, state votes) are unaffected.
+    ///
+    /// When `trace-propagation` feature is disabled in the messages crate,
+    /// this sets an empty trace context (no-op).
+    pub fn inject_trace_context(&mut self) {
+        let ctx = TraceContext::from_current();
+        match self {
+            OutboundMessage::StateProvision(gossip) => {
+                gossip.trace_context = ctx;
+            }
+            OutboundMessage::StateCertificate(gossip) => {
+                gossip.trace_context = ctx;
+            }
+            OutboundMessage::TransactionGossip(gossip) => {
+                gossip.trace_context = ctx;
+            }
+            // BFT consensus and state vote messages don't carry trace context
+            OutboundMessage::BlockHeader(_)
+            | OutboundMessage::BlockVote(_)
+            | OutboundMessage::ViewChangeVote(_)
+            | OutboundMessage::ViewChangeCertificate(_)
+            | OutboundMessage::StateVoteBlock(_) => {}
+        }
     }
 }

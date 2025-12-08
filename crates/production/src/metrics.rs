@@ -1,0 +1,430 @@
+//! Production metrics using native Prometheus client.
+//!
+//! Metrics are domain-specific rather than generic event counters.
+//! Use traces for event-level granularity during investigations.
+
+use prometheus::{
+    register_counter, register_counter_vec, register_gauge, register_histogram,
+    register_histogram_vec, Counter, CounterVec, Gauge, Histogram, HistogramVec,
+};
+use std::sync::OnceLock;
+
+static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+/// Domain-specific metrics for production monitoring.
+pub struct Metrics {
+    // === Consensus ===
+    pub blocks_committed: Counter,
+    pub block_commit_latency: Histogram,
+    pub block_height: Gauge,
+    pub view_changes: Counter,
+
+    // === Transactions ===
+    pub transactions_finalized: HistogramVec,
+    pub mempool_size: Gauge,
+
+    // === Cross-shard ===
+    pub cross_shard_pending: Gauge,
+
+    // === Infrastructure ===
+    pub network_messages_sent: Counter,
+    pub network_messages_received: Counter,
+    pub signature_verification_latency: Histogram,
+
+    // === Thread Pools ===
+    pub crypto_pool_queue_depth: Gauge,
+    pub execution_pool_queue_depth: Gauge,
+
+    // === Storage ===
+    pub rocksdb_read_latency: Histogram,
+    pub rocksdb_write_latency: Histogram,
+
+    // === Network ===
+    pub libp2p_peers_connected: Gauge,
+    pub libp2p_bandwidth_in_bytes: Counter,
+    pub libp2p_bandwidth_out_bytes: Counter,
+
+    // === Sync ===
+    pub sync_blocks_behind: Gauge,
+    pub sync_blocks_downloaded: Counter,
+    pub sync_in_progress: Gauge,
+
+    // === Livelock ===
+    pub livelock_cycles_detected: Counter,
+    pub livelock_deferrals: Counter,
+    pub livelock_deferred_transactions: Gauge,
+
+    // === Lock Contention ===
+    pub lock_contention_blocked: Gauge,
+    pub lock_contention_ratio: Gauge,
+
+    // === Errors ===
+    pub signature_verification_failures: Counter,
+    pub invalid_messages_received: Counter,
+    pub transactions_rejected: CounterVec,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        // Latency buckets: 1ms to 60s
+        let latency_buckets = vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+        ];
+
+        Self {
+            // Consensus
+            blocks_committed: register_counter!(
+                "hyperscale_blocks_committed_total",
+                "Total number of blocks committed"
+            )
+            .unwrap(),
+
+            block_commit_latency: register_histogram!(
+                "hyperscale_block_commit_latency_seconds",
+                "Time from proposal to commit",
+                latency_buckets.clone()
+            )
+            .unwrap(),
+
+            block_height: register_gauge!("hyperscale_block_height", "Current block height")
+                .unwrap(),
+
+            view_changes: register_counter!(
+                "hyperscale_view_changes_total",
+                "Total number of view changes triggered"
+            )
+            .unwrap(),
+
+            // Transactions
+            transactions_finalized: register_histogram_vec!(
+                "hyperscale_transaction_latency_seconds",
+                "Transaction end-to-end latency",
+                &["cross_shard"],
+                latency_buckets.clone()
+            )
+            .unwrap(),
+
+            mempool_size: register_gauge!(
+                "hyperscale_mempool_size",
+                "Number of pending transactions in mempool"
+            )
+            .unwrap(),
+
+            // Cross-shard
+            cross_shard_pending: register_gauge!(
+                "hyperscale_cross_shard_pending",
+                "Number of cross-shard transactions in flight"
+            )
+            .unwrap(),
+
+            // Infrastructure
+            network_messages_sent: register_counter!(
+                "hyperscale_network_messages_sent_total",
+                "Total network messages sent"
+            )
+            .unwrap(),
+
+            network_messages_received: register_counter!(
+                "hyperscale_network_messages_received_total",
+                "Total network messages received"
+            )
+            .unwrap(),
+
+            signature_verification_latency: register_histogram!(
+                "hyperscale_signature_verification_latency_seconds",
+                "Signature verification latency",
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
+            )
+            .unwrap(),
+
+            // Thread Pools
+            crypto_pool_queue_depth: register_gauge!(
+                "hyperscale_crypto_pool_queue_depth",
+                "Number of pending tasks in crypto verification pool"
+            )
+            .unwrap(),
+
+            execution_pool_queue_depth: register_gauge!(
+                "hyperscale_execution_pool_queue_depth",
+                "Number of pending tasks in execution pool"
+            )
+            .unwrap(),
+
+            // Storage
+            rocksdb_read_latency: register_histogram!(
+                "hyperscale_rocksdb_read_latency_seconds",
+                "RocksDB read operation latency",
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+            )
+            .unwrap(),
+
+            rocksdb_write_latency: register_histogram!(
+                "hyperscale_rocksdb_write_latency_seconds",
+                "RocksDB write operation latency",
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+            )
+            .unwrap(),
+
+            // Network
+            libp2p_peers_connected: register_gauge!(
+                "hyperscale_libp2p_peers_connected",
+                "Number of connected libp2p peers"
+            )
+            .unwrap(),
+
+            libp2p_bandwidth_in_bytes: register_counter!(
+                "hyperscale_libp2p_bandwidth_in_bytes_total",
+                "Total bytes received via libp2p"
+            )
+            .unwrap(),
+
+            libp2p_bandwidth_out_bytes: register_counter!(
+                "hyperscale_libp2p_bandwidth_out_bytes_total",
+                "Total bytes sent via libp2p"
+            )
+            .unwrap(),
+
+            // Sync
+            sync_blocks_behind: register_gauge!(
+                "hyperscale_sync_blocks_behind",
+                "Number of blocks behind the network head"
+            )
+            .unwrap(),
+
+            sync_blocks_downloaded: register_counter!(
+                "hyperscale_sync_blocks_downloaded_total",
+                "Total blocks downloaded during sync"
+            )
+            .unwrap(),
+
+            sync_in_progress: register_gauge!(
+                "hyperscale_sync_in_progress",
+                "Whether sync is currently active (0 or 1)"
+            )
+            .unwrap(),
+
+            // Livelock
+            livelock_cycles_detected: register_counter!(
+                "hyperscale_livelock_cycles_detected_total",
+                "Total number of cross-shard cycles detected"
+            )
+            .unwrap(),
+
+            livelock_deferrals: register_counter!(
+                "hyperscale_livelock_deferrals_total",
+                "Total number of transaction deferrals due to cycle detection"
+            )
+            .unwrap(),
+
+            livelock_deferred_transactions: register_gauge!(
+                "hyperscale_livelock_deferred_transactions",
+                "Current number of deferred transactions awaiting retry"
+            )
+            .unwrap(),
+
+            // Lock Contention
+            lock_contention_blocked: register_gauge!(
+                "hyperscale_lock_contention_blocked",
+                "Number of transactions currently blocked by lock contention"
+            )
+            .unwrap(),
+
+            lock_contention_ratio: register_gauge!(
+                "hyperscale_lock_contention_ratio",
+                "Ratio of blocked transactions to total (0.0 to 1.0)"
+            )
+            .unwrap(),
+
+            // Errors
+            signature_verification_failures: register_counter!(
+                "hyperscale_signature_verification_failures_total",
+                "Total signature verification failures"
+            )
+            .unwrap(),
+
+            invalid_messages_received: register_counter!(
+                "hyperscale_invalid_messages_received_total",
+                "Total invalid/malformed messages received"
+            )
+            .unwrap(),
+
+            transactions_rejected: register_counter_vec!(
+                "hyperscale_transactions_rejected_total",
+                "Total transactions rejected",
+                &["reason"]
+            )
+            .unwrap(),
+        }
+    }
+}
+
+/// Get or initialize the global metrics instance.
+pub fn metrics() -> &'static Metrics {
+    METRICS.get_or_init(Metrics::new)
+}
+
+/// Record a block committed.
+pub fn record_block_committed(height: u64, commit_latency_secs: f64) {
+    let m = metrics();
+    m.blocks_committed.inc();
+    m.block_commit_latency.observe(commit_latency_secs);
+    m.block_height.set(height as f64);
+}
+
+/// Record a transaction finalized.
+pub fn record_transaction_finalized(latency_secs: f64, cross_shard: bool) {
+    let label = if cross_shard { "true" } else { "false" };
+    metrics()
+        .transactions_finalized
+        .with_label_values(&[label])
+        .observe(latency_secs);
+}
+
+/// Record a view change.
+pub fn record_view_change() {
+    metrics().view_changes.inc();
+}
+
+/// Update mempool size.
+pub fn set_mempool_size(size: usize) {
+    metrics().mempool_size.set(size as f64);
+}
+
+/// Update cross-shard pending count.
+pub fn set_cross_shard_pending(count: usize) {
+    metrics().cross_shard_pending.set(count as f64);
+}
+
+/// Update thread pool queue depths.
+pub fn set_pool_queue_depths(crypto: usize, execution: usize) {
+    let m = metrics();
+    m.crypto_pool_queue_depth.set(crypto as f64);
+    m.execution_pool_queue_depth.set(execution as f64);
+}
+
+/// Record RocksDB read latency.
+pub fn record_rocksdb_read(latency_secs: f64) {
+    metrics().rocksdb_read_latency.observe(latency_secs);
+}
+
+/// Record RocksDB write latency.
+pub fn record_rocksdb_write(latency_secs: f64) {
+    metrics().rocksdb_write_latency.observe(latency_secs);
+}
+
+/// Update libp2p peer count.
+pub fn set_libp2p_peers(count: usize) {
+    metrics().libp2p_peers_connected.set(count as f64);
+}
+
+/// Record libp2p bandwidth.
+pub fn record_libp2p_bandwidth(bytes_in: u64, bytes_out: u64) {
+    let m = metrics();
+    m.libp2p_bandwidth_in_bytes.inc_by(bytes_in as f64);
+    m.libp2p_bandwidth_out_bytes.inc_by(bytes_out as f64);
+}
+
+/// Update sync status.
+pub fn set_sync_status(blocks_behind: u64, in_progress: bool) {
+    let m = metrics();
+    m.sync_blocks_behind.set(blocks_behind as f64);
+    m.sync_in_progress.set(if in_progress { 1.0 } else { 0.0 });
+}
+
+/// Record a block downloaded during sync.
+pub fn record_sync_block_downloaded() {
+    metrics().sync_blocks_downloaded.inc();
+}
+
+/// Record a livelock cycle detection event.
+pub fn record_livelock_cycle_detected() {
+    metrics().livelock_cycles_detected.inc();
+}
+
+/// Record a transaction deferral due to cycle detection.
+pub fn record_livelock_deferral() {
+    metrics().livelock_deferrals.inc();
+}
+
+/// Update the count of currently deferred transactions.
+pub fn set_livelock_deferred_count(count: usize) {
+    metrics().livelock_deferred_transactions.set(count as f64);
+}
+
+/// Record a signature verification failure.
+pub fn record_signature_verification_failure() {
+    metrics().signature_verification_failures.inc();
+}
+
+/// Record an invalid message received.
+pub fn record_invalid_message() {
+    metrics().invalid_messages_received.inc();
+}
+
+/// Record a transaction rejection with reason.
+///
+/// **Cardinality control**: Use only these predefined reasons to avoid
+/// label explosion in Prometheus:
+/// - `"duplicate"` - transaction already in mempool
+/// - `"invalid_signature"` - signature verification failed
+/// - `"invalid_format"` - malformed transaction
+/// - `"wrong_shard"` - transaction routed to wrong shard
+/// - `"mempool_full"` - mempool capacity exceeded
+/// - `"nonce_too_low"` - nonce already used
+/// - `"insufficient_balance"` - sender has insufficient funds
+/// - `"execution_failed"` - transaction execution rejected
+///
+/// Do NOT use dynamic strings (e.g., error messages) as reasons.
+pub fn record_transaction_rejected(reason: &str) {
+    debug_assert!(
+        matches!(
+            reason,
+            "duplicate"
+                | "invalid_signature"
+                | "invalid_format"
+                | "wrong_shard"
+                | "mempool_full"
+                | "nonce_too_low"
+                | "insufficient_balance"
+                | "execution_failed"
+        ),
+        "Unknown rejection reason: {} - add to allowed list or use existing",
+        reason
+    );
+    metrics()
+        .transactions_rejected
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record network message sent.
+pub fn record_network_message_sent() {
+    metrics().network_messages_sent.inc();
+}
+
+/// Record network message received.
+pub fn record_network_message_received() {
+    metrics().network_messages_received.inc();
+}
+
+/// Record signature verification latency.
+pub fn record_signature_verification_latency(latency_secs: f64) {
+    metrics()
+        .signature_verification_latency
+        .observe(latency_secs);
+}
+
+/// Update lock contention metrics.
+pub fn set_lock_contention(blocked: u64, ratio: f64) {
+    let m = metrics();
+    m.lock_contention_blocked.set(blocked as f64);
+    m.lock_contention_ratio.set(ratio);
+}
+
+/// Update lock contention metrics from LockContentionStats.
+///
+/// This is a convenience wrapper that extracts the relevant fields
+/// from the mempool's LockContentionStats struct.
+pub fn set_lock_contention_from_stats(stats: &hyperscale_mempool::LockContentionStats) {
+    set_lock_contention(stats.blocked_count, stats.contention_ratio());
+}

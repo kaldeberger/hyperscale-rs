@@ -70,14 +70,17 @@
 //! let shared_pools = Arc::new(manager);
 //! ```
 
+pub mod metrics;
 pub mod network;
 mod runner;
 mod storage;
 mod sync;
+pub mod telemetry;
 mod thread_pools;
 mod timers;
 
 pub use sync::{SyncConfig, SyncManager};
+pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryError, TelemetryGuard};
 pub use timers::TimerManager;
 
 pub use runner::{ProductionRunner, RunnerError, ShutdownHandle};

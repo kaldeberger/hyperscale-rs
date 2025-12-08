@@ -10,6 +10,7 @@ use super::codec::{decode_message, encode_message, CodecError};
 use super::config::Libp2pConfig;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
+use crate::metrics;
 use futures::StreamExt;
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_types::{ShardGroupId, ValidatorId};
@@ -23,7 +24,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+#[cfg(feature = "trace-propagation")]
+use tracing::Instrument;
 use tracing::{debug, info, trace, warn};
+#[cfg(feature = "trace-propagation")]
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// An inbound sync request from a peer.
 ///
@@ -418,6 +423,7 @@ impl Libp2pAdapter {
     ) -> Result<(), NetworkError> {
         let topic = super::codec::topic_for_message(message, shard);
         let data = encode_message(message)?;
+        let data_len = data.len();
 
         self.command_tx
             .send(SwarmCommand::Broadcast {
@@ -425,6 +431,10 @@ impl Libp2pAdapter {
                 data,
             })
             .map_err(|_| NetworkError::NetworkShutdown)?;
+
+        // Record metrics
+        metrics::record_network_message_sent();
+        metrics::record_libp2p_bandwidth(0, data_len as u64);
 
         trace!(
             topic = %topic,
@@ -684,6 +694,10 @@ impl Libp2pAdapter {
                 ..
             })) => {
                 let topic = message.topic.to_string();
+                let data_len = message.data.len();
+
+                // Record inbound bandwidth
+                metrics::record_libp2p_bandwidth(data_len as u64, 0);
 
                 // Validate sender is a known validator
                 let peer_map = peer_validators.read().await;
@@ -693,16 +707,36 @@ impl Libp2pAdapter {
                         topic = %topic,
                         "Ignoring message from unknown peer"
                     );
+                    metrics::record_invalid_message();
                     return;
                 }
                 drop(peer_map);
 
                 // Decode message based on topic
                 match decode_message(&topic, &message.data) {
-                    Ok(event) => {
-                        if event_tx.send(event).await.is_err() {
-                            warn!("Event channel closed");
-                        }
+                    Ok(decoded) => {
+                        metrics::record_network_message_received();
+
+                        // Extract trace context for distributed tracing (when feature enabled)
+                        // We attach the OpenTelemetry context, create a tracing span to capture it,
+                        // then use Future::instrument to attach the span to the send future.
+                        // This ensures the context is active during the async operation.
+                        let send_future = async {
+                            if event_tx.send(decoded.event).await.is_err() {
+                                warn!("Event channel closed");
+                            }
+                        };
+                        #[cfg(feature = "trace-propagation")]
+                        let send_future = {
+                            let span = tracing::trace_span!("cross_shard_message");
+                            if let Some(ref trace_ctx) = decoded.trace_context {
+                                let _ = span.set_parent(trace_ctx.extract());
+                                tracing::trace!("Extracted trace context from cross-shard message");
+                            }
+                            send_future.instrument(span)
+                        };
+
+                        send_future.await;
                     }
                     Err(e) => {
                         warn!(
@@ -711,6 +745,7 @@ impl Libp2pAdapter {
                             peer = %propagation_source,
                             "Failed to decode message"
                         );
+                        metrics::record_invalid_message();
                     }
                 }
             }
@@ -823,19 +858,32 @@ impl Libp2pAdapter {
 
             // Connection events
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                num_established,
+                ..
             } => {
                 info!(
                     peer = %peer_id,
                     addr = %endpoint.get_remote_address(),
+                    total_connections = num_established.get(),
                     "Connection established"
                 );
+                // Note: num_established is connections to this peer, not total peers
+                // We would need swarm.connected_peers().count() for total, but we don't have access here
+                // The metrics tick in runner.rs can poll connected_peers() periodically instead
             }
 
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                cause,
+                num_established,
+                ..
+            } => {
                 info!(
                     peer = %peer_id,
                     cause = ?cause,
+                    remaining_connections = num_established,
                     "Connection closed"
                 );
             }

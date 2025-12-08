@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tracing::{instrument, span, Level, Span};
 
 /// Errors from the production runner.
 #[derive(Debug, Error)]
@@ -359,6 +360,10 @@ impl ProductionRunner {
         let mut sync_tick = tokio::time::interval(Duration::from_millis(100));
         sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Metrics tick interval (1 second)
+        let mut metrics_tick = tokio::time::interval(Duration::from_secs(1));
+        metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         // Track consecutive consensus events for batch limiting
         let mut consensus_batch_count: usize = 0;
 
@@ -392,6 +397,18 @@ impl ProductionRunner {
                         Some(event) => {
                             consensus_batch_count += 1;
 
+                            // Create span for event handling
+                            let event_type = event.type_name();
+                            let event_span = span!(
+                                Level::INFO,
+                                "handle_event",
+                                event.type = %event_type,
+                                node = self.state.node_index(),
+                                shard = ?self.state.shard(),
+                                otel.kind = "INTERNAL",
+                            );
+                            let _event_guard = event_span.enter();
+
                             // Update time
                             let now = self.start_time.elapsed();
                             self.state.set_time(now);
@@ -404,7 +421,14 @@ impl ProductionRunner {
                             };
 
                             // Process event synchronously (fast)
-                            let actions = self.state.handle(event);
+                            let actions = {
+                                let sm_span = span!(Level::DEBUG, "state_machine.handle");
+                                let _sm_guard = sm_span.enter();
+                                self.state.handle(event)
+                            };
+
+                            // Record action count
+                            Span::current().record("actions.count", actions.len());
 
                             // Execute actions
                             for action in actions {
@@ -430,6 +454,15 @@ impl ProductionRunner {
                 // LOW PRIORITY: Handle inbound sync requests from peers
                 // This branch is checked when consensus is idle OR after batch limit hit
                 Some(request) = sync_request_future => {
+                    let sync_span = span!(
+                        Level::DEBUG,
+                        "handle_sync_request",
+                        peer = %request.peer,
+                        height = request.height,
+                        channel_id = request.channel_id,
+                    );
+                    let _sync_guard = sync_span.enter();
+
                     self.handle_inbound_sync_request(request);
                     // Reset batch counter - we yielded to sync, now back to prioritizing consensus
                     consensus_batch_count = 0;
@@ -438,11 +471,37 @@ impl ProductionRunner {
                 // MEDIUM PRIORITY: Periodic sync manager tick
                 // This drives outbound sync fetches, so give it some priority
                 _ = sync_tick.tick() => {
+                    let tick_span = span!(Level::TRACE, "sync_tick");
+                    let _tick_guard = tick_span.enter();
+
                     if let Some(sync_mgr) = &mut self.sync_manager {
                         sync_mgr.tick().await;
                     }
                     // Reset batch counter - we yielded, now back to prioritizing consensus
                     consensus_batch_count = 0;
+                }
+
+                // LOW PRIORITY: Periodic metrics update (1 second)
+                _ = metrics_tick.tick() => {
+                    // Update thread pool queue depths
+                    crate::metrics::set_pool_queue_depths(
+                        self.thread_pools.crypto_queue_depth(),
+                        self.thread_pools.execution_queue_depth(),
+                    );
+
+                    // Update sync status
+                    if let Some(sync_mgr) = &self.sync_manager {
+                        crate::metrics::set_sync_status(
+                            sync_mgr.blocks_behind(),
+                            sync_mgr.is_syncing(),
+                        );
+                    }
+
+                    // Update peer count
+                    if let Some(network) = &self.network {
+                        let peer_count = network.connected_peers().await.len();
+                        crate::metrics::set_libp2p_peers(peer_count);
+                    }
                 }
             }
         }
@@ -452,10 +511,14 @@ impl ProductionRunner {
     }
 
     /// Process an action.
+    #[instrument(skip(self), fields(action.type = %action.type_name()))]
     async fn process_action(&mut self, action: Action) -> Result<(), RunnerError> {
         match action {
             // Network I/O - broadcast via gossipsub topics
-            Action::BroadcastToShard { shard, message } => {
+            Action::BroadcastToShard { shard, mut message } => {
+                // Inject trace context for cross-shard messages (no-op if feature disabled)
+                message.inject_trace_context();
+
                 if let Some(network) = &self.network {
                     network.broadcast_shard(shard, &message).await?;
                     tracing::debug!(?shard, msg_type = message.type_name(), "Broadcast to shard");
@@ -468,7 +531,10 @@ impl ProductionRunner {
                 }
             }
 
-            Action::BroadcastGlobal { message } => {
+            Action::BroadcastGlobal { mut message } => {
+                // Inject trace context for cross-shard messages (no-op if feature disabled)
+                message.inject_trace_context();
+
                 if let Some(network) = &self.network {
                     network.broadcast_global(&message).await?;
                     tracing::debug!(msg_type = message.type_name(), "Broadcast globally");
@@ -497,8 +563,15 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
                     // Verify vote signature against domain-separated message
                     let valid = public_key.verify(&signing_message, &vote.signature);
+                    crate::metrics::record_signature_verification_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
                     let _ = event_tx.blocking_send(Event::VoteSignatureVerified { vote, valid });
                 });
             }
@@ -509,6 +582,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
                     // Build signing message (must match ExecutionState::sign_provision)
                     let mut msg = Vec::new();
                     msg.extend_from_slice(b"STATE_PROVISION");
@@ -521,6 +595,12 @@ impl ProductionRunner {
                     }
 
                     let valid = public_key.verify(&msg, &provision.signature);
+                    crate::metrics::record_signature_verification_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
                     let _ = event_tx
                         .blocking_send(Event::ProvisionSignatureVerified { provision, valid });
                 });
@@ -529,6 +609,7 @@ impl ProductionRunner {
             Action::VerifyStateVoteSignature { vote, public_key } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
                     // Build signing message (must match ExecutionState::create_vote)
                     let mut msg = Vec::new();
                     msg.extend_from_slice(b"EXEC_VOTE");
@@ -538,6 +619,12 @@ impl ProductionRunner {
                     msg.push(if vote.success { 1 } else { 0 });
 
                     let valid = public_key.verify(&msg, &vote.signature);
+                    crate::metrics::record_signature_verification_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
                     let _ =
                         event_tx.blocking_send(Event::StateVoteSignatureVerified { vote, valid });
                 });
@@ -549,6 +636,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
                     // Build signing message
                     let mut msg = Vec::new();
                     msg.extend_from_slice(b"STATE_CERT");
@@ -578,6 +666,12 @@ impl ProductionRunner {
                         }
                     };
 
+                    crate::metrics::record_signature_verification_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
                     let _ = event_tx.blocking_send(Event::StateCertificateSignatureVerified {
                         certificate,
                         valid,
@@ -593,6 +687,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
                     // Get signer keys based on QC's signer bitfield
                     let signer_keys: Vec<_> = public_keys
                         .iter()
@@ -614,6 +709,12 @@ impl ProductionRunner {
                         }
                     };
 
+                    crate::metrics::record_signature_verification_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
                     let _ =
                         event_tx.blocking_send(Event::QcSignatureVerified { block_hash, valid });
                 });
@@ -626,7 +727,14 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
                     let valid = public_key.verify(&signing_message, &vote.signature);
+                    crate::metrics::record_signature_verification_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
                     let _ = event_tx
                         .blocking_send(Event::ViewChangeVoteSignatureVerified { vote, valid });
                 });
@@ -639,6 +747,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
                     // Get signer keys based on the highest_qc's signer bitfield
                     let signer_keys: Vec<_> = public_keys
                         .iter()
@@ -658,6 +767,12 @@ impl ProductionRunner {
                         }
                     };
 
+                    crate::metrics::record_signature_verification_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
                     let _ =
                         event_tx.blocking_send(Event::ViewChangeHighestQcVerified { vote, valid });
                 });
@@ -670,6 +785,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
                     // Verify aggregated BLS signature on the view change certificate
                     // The public_keys are pre-filtered by the state machine based on the signer bitfield
                     let valid = if public_keys.is_empty() {
@@ -682,6 +798,12 @@ impl ProductionRunner {
                         }
                     };
 
+                    crate::metrics::record_signature_verification_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
                     let _ = event_tx.blocking_send(Event::ViewChangeCertificateSignatureVerified {
                         certificate,
                         valid,

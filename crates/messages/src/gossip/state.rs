@@ -1,5 +1,6 @@
 //! State-related gossip messages for cross-shard transactions.
 
+use crate::trace_context::TraceContext;
 use hyperscale_types::{
     NetworkMessage, ShardMessage, StateCertificate, StateProvision, StateVoteBlock,
 };
@@ -11,12 +12,31 @@ use sbor::prelude::BasicSbor;
 pub struct StateProvisionGossip {
     /// The state provision being broadcast
     pub provision: StateProvision,
+    /// Trace context for distributed tracing (empty when feature disabled).
+    pub trace_context: TraceContext,
 }
 
 impl StateProvisionGossip {
     /// Create a new state provision gossip message.
+    ///
+    /// Does not capture trace context. Use `with_trace_context()` to include
+    /// distributed tracing information.
     pub fn new(provision: StateProvision) -> Self {
-        Self { provision }
+        Self {
+            provision,
+            trace_context: TraceContext::default(),
+        }
+    }
+
+    /// Create a new state provision gossip message with trace context from current span.
+    ///
+    /// When `trace-propagation` feature is enabled, captures the current OpenTelemetry
+    /// span context for distributed tracing across nodes.
+    pub fn with_trace_context(provision: StateProvision) -> Self {
+        Self {
+            provision,
+            trace_context: TraceContext::from_current(),
+        }
     }
 
     /// Get the inner state provision.
@@ -27,6 +47,11 @@ impl StateProvisionGossip {
     /// Consume and return the inner state provision.
     pub fn into_provision(self) -> StateProvision {
         self.provision
+    }
+
+    /// Get the trace context.
+    pub fn trace_context(&self) -> &TraceContext {
+        &self.trace_context
     }
 }
 
@@ -79,12 +104,31 @@ impl ShardMessage for StateVoteBlockGossip {}
 pub struct StateCertificateGossip {
     /// The state certificate being gossiped
     pub certificate: StateCertificate,
+    /// Trace context for distributed tracing (empty when feature disabled).
+    pub trace_context: TraceContext,
 }
 
 impl StateCertificateGossip {
     /// Create a new state certificate gossip message.
+    ///
+    /// Does not capture trace context. Use `with_trace_context()` to include
+    /// distributed tracing information.
     pub fn new(certificate: StateCertificate) -> Self {
-        Self { certificate }
+        Self {
+            certificate,
+            trace_context: TraceContext::default(),
+        }
+    }
+
+    /// Create a new state certificate gossip message with trace context from current span.
+    ///
+    /// When `trace-propagation` feature is enabled, captures the current OpenTelemetry
+    /// span context for distributed tracing across nodes.
+    pub fn with_trace_context(certificate: StateCertificate) -> Self {
+        Self {
+            certificate,
+            trace_context: TraceContext::from_current(),
+        }
     }
 
     /// Get the inner state certificate.
@@ -95,6 +139,11 @@ impl StateCertificateGossip {
     /// Consume and return the inner state certificate.
     pub fn into_certificate(self) -> StateCertificate {
         self.certificate
+    }
+
+    /// Get the trace context.
+    pub fn trace_context(&self) -> &TraceContext {
+        &self.trace_context
     }
 }
 
@@ -185,5 +234,55 @@ mod tests {
             StateCertificateGossip::message_type_id(),
             "state.certificate"
         );
+    }
+
+    #[test]
+    fn test_state_provision_trace_context() {
+        let provision = StateProvision {
+            transaction_hash: Hash::from_bytes(b"tx"),
+            target_shard: ShardGroupId(1),
+            source_shard: ShardGroupId(0),
+            block_height: BlockHeight(10),
+            entries: vec![],
+            validator_id: ValidatorId(0),
+            signature: Signature::zero(),
+        };
+
+        // new() should have empty trace context
+        let msg = StateProvisionGossip::new(provision.clone());
+        assert!(!msg.trace_context().has_trace());
+
+        // with_trace_context() without active span should also be empty
+        let msg_with_ctx = StateProvisionGossip::with_trace_context(provision);
+        // When no span is active, trace context will be empty
+        assert!(!msg_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
+    }
+
+    #[test]
+    fn test_state_certificate_trace_context() {
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+
+        let cert = StateCertificate {
+            transaction_hash: Hash::from_bytes(b"tx"),
+            shard_group_id: ShardGroupId(0),
+            read_nodes: vec![],
+            state_writes: vec![],
+            outputs_merkle_root: Hash::from_bytes(b"root"),
+            success: true,
+            aggregated_signature: Signature::zero(),
+            signers,
+            voting_power: 3,
+        };
+
+        // new() should have empty trace context
+        let msg = StateCertificateGossip::new(cert.clone());
+        assert!(!msg.trace_context().has_trace());
+
+        // with_trace_context() without active span should also be empty
+        let msg_with_ctx = StateCertificateGossip::with_trace_context(cert);
+        assert!(!msg_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
     }
 }

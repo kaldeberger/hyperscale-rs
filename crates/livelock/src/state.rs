@@ -374,6 +374,26 @@ impl LivelockState {
     pub fn is_cross_shard(&self, tx: &RoutableTransaction) -> bool {
         !self.provisioning_shards_for_tx(tx).is_empty()
     }
+
+    /// Get statistics for metrics.
+    pub fn stats(&self) -> LivelockStats {
+        LivelockStats {
+            pending_deferrals: self.pending_deferrals.len(),
+            active_tombstones: self.deferred_tombstones.len(),
+            tracked_transactions: self.committed_tracker.len(),
+        }
+    }
+}
+
+/// Statistics from the livelock state machine for metrics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LivelockStats {
+    /// Number of deferrals queued for next block.
+    pub pending_deferrals: usize,
+    /// Number of active tombstones (recently deferred transactions).
+    pub active_tombstones: usize,
+    /// Number of transactions being tracked for cycle detection.
+    pub tracked_transactions: usize,
 }
 
 impl SubStateMachine for LivelockState {

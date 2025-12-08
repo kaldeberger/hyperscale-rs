@@ -38,5 +38,5 @@
 mod state;
 mod tracker;
 
-pub use state::{LivelockConfig, LivelockState};
+pub use state::{LivelockConfig, LivelockState, LivelockStats};
 pub use tracker::{CommittedCrossShardTracker, ProvisionTracker};

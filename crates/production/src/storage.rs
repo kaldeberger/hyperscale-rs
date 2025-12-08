@@ -5,6 +5,7 @@
 //! All operations are synchronous blocking I/O. Callers in async contexts
 //! should use `spawn_blocking` if needed to avoid blocking the runtime.
 
+use crate::metrics;
 use hyperscale_engine::{
     keys, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
     DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase, SubstateStore,
@@ -14,6 +15,7 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use sbor::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// RocksDB-based storage for production use.
 ///
@@ -117,8 +119,11 @@ impl SubstateDatabase for RocksDbStorage {
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
+        let start = Instant::now();
         let key = keys::to_storage_key(partition_key, sort_key);
-        self.db.get(&key).ok().flatten()
+        let result = self.db.get(&key).ok().flatten();
+        metrics::record_rocksdb_read(start.elapsed().as_secs_f64());
+        result
     }
 
     fn list_raw_values_from_db_key(
@@ -154,6 +159,7 @@ impl SubstateDatabase for RocksDbStorage {
 
 impl CommittableSubstateDatabase for RocksDbStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
+        let start = Instant::now();
         let mut batch = WriteBatch::default();
 
         for (node_key, node_updates) in &updates.node_updates {
@@ -202,6 +208,7 @@ impl CommittableSubstateDatabase for RocksDbStorage {
         if let Err(e) = self.db.write(batch) {
             tracing::error!("Failed to commit updates: {}", e);
         }
+        metrics::record_rocksdb_write(start.elapsed().as_secs_f64());
     }
 }
 
@@ -335,10 +342,11 @@ impl RocksDbStorage {
 
     /// Get a committed block by height.
     pub fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+        let start = Instant::now();
         let cf = self.db.cf_handle("blocks")?;
         let key = height.0.to_be_bytes();
 
-        match self.db.get_cf(cf, key) {
+        let result = match self.db.get_cf(cf, key) {
             Ok(Some(value)) => match sbor::basic_decode::<(Block, QuorumCertificate)>(&value) {
                 Ok(result) => Some(result),
                 Err(e) => {
@@ -351,7 +359,9 @@ impl RocksDbStorage {
                 tracing::error!("Failed to read block at height {}: {}", height.0, e);
                 None
             }
-        }
+        };
+        metrics::record_rocksdb_read(start.elapsed().as_secs_f64());
+        result
     }
 
     /// Get a range of committed blocks [from, to).

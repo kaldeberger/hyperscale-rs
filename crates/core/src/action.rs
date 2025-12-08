@@ -350,6 +350,57 @@ impl Action {
                 | Action::FetchChainMetadata
         )
     }
+
+    /// Get the action type name for telemetry.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            // Network
+            Action::BroadcastToShard { .. } => "BroadcastToShard",
+            Action::BroadcastGlobal { .. } => "BroadcastGlobal",
+
+            // Timers
+            Action::SetTimer { .. } => "SetTimer",
+            Action::CancelTimer { .. } => "CancelTimer",
+
+            // Internal
+            Action::EnqueueInternal { .. } => "EnqueueInternal",
+
+            // Delegated Work - Crypto Verification
+            Action::VerifyVoteSignature { .. } => "VerifyVoteSignature",
+            Action::VerifyProvisionSignature { .. } => "VerifyProvisionSignature",
+            Action::VerifyStateVoteSignature { .. } => "VerifyStateVoteSignature",
+            Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
+            Action::VerifyQcSignature { .. } => "VerifyQcSignature",
+            Action::VerifyViewChangeVoteSignature { .. } => "VerifyViewChangeVoteSignature",
+            Action::VerifyViewChangeHighestQc { .. } => "VerifyViewChangeHighestQc",
+            Action::VerifyViewChangeCertificateSignature { .. } => {
+                "VerifyViewChangeCertificateSignature"
+            }
+
+            // Delegated Work - Execution
+            Action::ExecuteTransactions { .. } => "ExecuteTransactions",
+            Action::ExecuteCrossShardTransaction { .. } => "ExecuteCrossShardTransaction",
+            Action::ComputeMerkleRoot { .. } => "ComputeMerkleRoot",
+
+            // External Notifications
+            Action::EmitCommittedBlock { .. } => "EmitCommittedBlock",
+            Action::EmitTransactionResult { .. } => "EmitTransactionResult",
+            Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
+
+            // Storage - Consensus
+            Action::PersistBlock { .. } => "PersistBlock",
+            Action::PersistOwnVote { .. } => "PersistOwnVote",
+
+            // Storage - Execution
+            Action::PersistTransactionCertificate { .. } => "PersistTransactionCertificate",
+            Action::PersistSubstateWrites { .. } => "PersistSubstateWrites",
+
+            // Storage - Read Requests
+            Action::FetchStateEntries { .. } => "FetchStateEntries",
+            Action::FetchBlock { .. } => "FetchBlock",
+            Action::FetchChainMetadata => "FetchChainMetadata",
+        }
+    }
 }
 
 // Re-export TransactionStatus from types crate

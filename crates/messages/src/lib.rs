@@ -3,6 +3,7 @@
 pub mod gossip;
 pub mod request;
 pub mod response;
+pub mod trace_context;
 
 // Re-export commonly used types
 pub use gossip::{
@@ -12,3 +13,4 @@ pub use gossip::{
 };
 pub use request::{GetBlockInventoryRequest, GetBlockRequest, SyncCompleteAnnouncement};
 pub use response::{GetBlockInventoryResponse, GetBlockResponse};
+pub use trace_context::TraceContext;

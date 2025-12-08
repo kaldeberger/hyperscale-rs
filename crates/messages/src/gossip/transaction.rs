@@ -1,5 +1,6 @@
 //! Transaction gossip message.
 
+use crate::trace_context::TraceContext;
 use hyperscale_types::{NetworkMessage, RoutableTransaction, ShardMessage};
 use sbor::prelude::BasicSbor;
 
@@ -9,12 +10,31 @@ use sbor::prelude::BasicSbor;
 pub struct TransactionGossip {
     /// The transaction being gossiped
     pub transaction: RoutableTransaction,
+    /// Trace context for distributed tracing (empty when feature disabled).
+    pub trace_context: TraceContext,
 }
 
 impl TransactionGossip {
     /// Create a new transaction gossip message.
+    ///
+    /// Does not capture trace context. Use `with_trace_context()` to include
+    /// distributed tracing information.
     pub fn new(transaction: RoutableTransaction) -> Self {
-        Self { transaction }
+        Self {
+            transaction,
+            trace_context: TraceContext::default(),
+        }
+    }
+
+    /// Create a new transaction gossip message with trace context from current span.
+    ///
+    /// When `trace-propagation` feature is enabled, captures the current OpenTelemetry
+    /// span context for distributed tracing across nodes.
+    pub fn with_trace_context(transaction: RoutableTransaction) -> Self {
+        Self {
+            transaction,
+            trace_context: TraceContext::from_current(),
+        }
     }
 
     /// Get a reference to the inner transaction.
@@ -25,6 +45,11 @@ impl TransactionGossip {
     /// Consume and return the inner transaction.
     pub fn into_transaction(self) -> RoutableTransaction {
         self.transaction
+    }
+
+    /// Get the trace context.
+    pub fn trace_context(&self) -> &TraceContext {
+        &self.trace_context
     }
 }
 
@@ -72,5 +97,19 @@ mod tests {
 
         // Same data should produce same transaction hash
         assert_eq!(gossip1.transaction().hash(), gossip2.transaction().hash());
+    }
+
+    #[test]
+    fn test_transaction_gossip_trace_context() {
+        let tx = test_transaction_with_nodes(&[1, 2, 3], vec![test_node(1)], vec![test_node(2)]);
+
+        // new() should have empty trace context
+        let gossip = TransactionGossip::new(tx.clone());
+        assert!(!gossip.trace_context().has_trace());
+
+        // with_trace_context() without active span should also be empty
+        let gossip_with_ctx = TransactionGossip::with_trace_context(tx);
+        // When no span is active, trace context will be empty
+        assert!(!gossip_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
     }
 }

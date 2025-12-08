@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 description = "Production runner with async I/O"
 
+[features]
+default = []
+# Enable cross-node trace context propagation in messages.
+# Only useful in testnets/devnets where all nodes are instrumented.
+# Disabled by default for mainnet (no cross-node visibility anyway).
+trace-propagation = ["hyperscale-messages/trace-propagation"]
+
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
+hyperscale-mempool.workspace = true
 hyperscale-node.workspace = true
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
@@ -30,6 +38,28 @@ tokio.workspace = true
 rayon.workspace = true
 parking_lot = "0.12"
 
+# OpenTelemetry for distributed tracing
+opentelemetry = "0.31.0"
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
+opentelemetry-semantic-conventions = "0.31.0"
+
+# Tracing integration (version matched to opentelemetry 0.31.0)
+tracing-opentelemetry = "0.32.0"
+
+# Tracing subscriber for layer composition
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
+
+# Native Prometheus for metrics (not via OTEL - avoids translation issues)
+prometheus = "0.14.0"
+
+# JSON serialization for health check responses
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP server for metrics endpoint
+axum = "0.8.7"
+
 # Core pinning support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -38,3 +68,4 @@ libc = "0.2"
 tempfile = "3.0"
 serial_test = "3"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tower = "0.5"

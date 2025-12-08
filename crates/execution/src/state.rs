@@ -40,7 +40,7 @@ use hyperscale_types::{
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::pending::{
     PendingCertificateVerification, PendingProvisionBroadcast, PendingProvisionVerification,
@@ -265,6 +265,11 @@ impl ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle block committed - start executing transactions.
+    #[instrument(skip(self, transactions), fields(
+        height = height,
+        block_hash = ?block_hash,
+        tx_count = transactions.len()
+    ))]
     pub fn on_block_committed(
         &mut self,
         block_hash: Hash,
@@ -594,6 +599,10 @@ impl ExecutionState {
     }
 
     /// Handle execution completion callback for single-shard transactions.
+    #[instrument(skip(self, results), fields(
+        block_hash = ?block_hash,
+        result_count = results.len()
+    ))]
     pub fn on_execution_complete(
         &mut self,
         block_hash: Hash,
@@ -663,6 +672,11 @@ impl ExecutionState {
     /// Handle a state provision received from another validator.
     ///
     /// Sender identity comes from provision.validator_id.
+    #[instrument(skip(self, provision), fields(
+        tx_hash = ?provision.transaction_hash,
+        source_shard = provision.source_shard.0,
+        validator = ?provision.validator_id
+    ))]
     pub fn on_provision(&mut self, provision: StateProvision) -> Vec<Action> {
         let tx_hash = provision.transaction_hash;
         let validator_id = provision.validator_id;
@@ -707,6 +721,11 @@ impl ExecutionState {
     }
 
     /// Handle provision signature verification result.
+    #[instrument(skip(self, provision), fields(
+        tx_hash = ?provision.transaction_hash,
+        validator = ?provision.validator_id,
+        valid = valid
+    ))]
     pub fn on_provision_verified(&mut self, provision: StateProvision, valid: bool) -> Vec<Action> {
         let tx_hash = provision.transaction_hash;
         let validator_id = provision.validator_id;
@@ -811,6 +830,10 @@ impl ExecutionState {
     ///
     /// Called when the runner completes `Action::ExecuteCrossShardTransaction`.
     /// Creates and broadcasts a vote based on the execution result.
+    #[instrument(skip(self, result), fields(
+        tx_hash = ?result.transaction_hash,
+        success = result.success
+    ))]
     pub fn on_cross_shard_execution_complete(&mut self, result: ExecutionResult) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = result.transaction_hash;
@@ -874,6 +897,11 @@ impl ExecutionState {
     /// Handle a state vote received from another validator.
     ///
     /// Sender identity comes from vote.validator_id.
+    #[instrument(skip(self, vote), fields(
+        tx_hash = ?vote.transaction_hash,
+        validator = ?vote.validator,
+        success = vote.success
+    ))]
     pub fn on_vote(&mut self, vote: StateVoteBlock) -> Vec<Action> {
         let tx_hash = vote.transaction_hash;
         let validator_id = vote.validator;
@@ -916,6 +944,11 @@ impl ExecutionState {
     }
 
     /// Handle state vote signature verification result.
+    #[instrument(skip(self, vote), fields(
+        tx_hash = ?vote.transaction_hash,
+        validator = ?vote.validator,
+        valid = valid
+    ))]
     pub fn on_state_vote_verified(&mut self, vote: StateVoteBlock, valid: bool) -> Vec<Action> {
         let tx_hash = vote.transaction_hash;
         let validator_id = vote.validator;
@@ -994,9 +1027,7 @@ impl ExecutionState {
             self.state_certificates.insert(tx_hash, certificate.clone());
 
             // Broadcast certificate to all participating shards
-            let gossip = StateCertificateGossip {
-                certificate: certificate.clone(),
-            };
+            let gossip = StateCertificateGossip::new(certificate.clone());
 
             for target_shard in participating_shards {
                 actions.push(Action::BroadcastToShard {
@@ -1075,6 +1106,11 @@ impl ExecutionState {
     ///
     /// Delegates signature verification to the runner before processing.
     /// Handle a state certificate received from another validator.
+    #[instrument(skip(self, cert), fields(
+        tx_hash = ?cert.transaction_hash,
+        shard = cert.shard_group_id.0,
+        success = cert.success
+    ))]
     pub fn on_certificate(&mut self, cert: StateCertificate) -> Vec<Action> {
         let tx_hash = cert.transaction_hash;
         let shard = cert.shard_group_id;
@@ -1125,6 +1161,11 @@ impl ExecutionState {
     }
 
     /// Handle state certificate signature verification result.
+    #[instrument(skip(self, certificate), fields(
+        tx_hash = ?certificate.transaction_hash,
+        shard = certificate.shard_group_id.0,
+        valid = valid
+    ))]
     pub fn on_certificate_verified(
         &mut self,
         certificate: StateCertificate,
@@ -1366,7 +1407,7 @@ impl ExecutionState {
                 ),
             };
 
-            let gossip = StateProvisionGossip { provision };
+            let gossip = StateProvisionGossip::new(provision);
             actions.push(Action::BroadcastToShard {
                 message: OutboundMessage::StateProvision(gossip),
                 shard: target_shard,

@@ -4,10 +4,20 @@ version.workspace = true
 edition.workspace = true
 description = "Network message types"
 
+[features]
+default = []
+# Enable cross-node trace context propagation in messages.
+# Only useful in testnets/devnets where all nodes are instrumented.
+trace-propagation = ["opentelemetry", "opentelemetry_sdk"]
+
 [dependencies]
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 # Serialization
 sbor.workspace = true
+
+# OpenTelemetry for trace context propagation (optional)
+opentelemetry = { version = "0.31.0", optional = true }
+opentelemetry_sdk = { version = "0.31.0", optional = true }
 
 [dev-dependencies]

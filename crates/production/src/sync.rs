@@ -9,6 +9,7 @@
 //! The state machine (`SyncState`) handles validation and ordering.
 //! The runner coordinates between them.
 
+use crate::metrics;
 use crate::network::Libp2pAdapter;
 use hyperscale_core::Event;
 use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate};
@@ -149,6 +150,13 @@ impl SyncManager {
         self.sync_target.map(|(h, _)| h)
     }
 
+    /// Get the number of blocks we're behind (for metrics).
+    pub fn blocks_behind(&self) -> u64 {
+        self.sync_target
+            .map(|(target, _)| target.saturating_sub(self.committed_height))
+            .unwrap_or(0)
+    }
+
     /// Update the committed height (called when state machine commits a block).
     pub fn set_committed_height(&mut self, height: u64) {
         self.committed_height = height;
@@ -253,6 +261,9 @@ impl SyncManager {
             }
 
             trace!(height, ?from_peer, "Block received for sync");
+
+            // Record metrics
+            metrics::record_sync_block_downloaded();
 
             // Mark as fetched
             self.fetched_heights.insert(height);

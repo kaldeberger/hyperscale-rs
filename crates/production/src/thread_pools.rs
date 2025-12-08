@@ -28,6 +28,7 @@
 //! ```
 
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -320,6 +321,12 @@ pub struct ThreadPoolManager {
 
     /// Rayon pool for execution operations (Radix Engine).
     execution_pool: rayon::ThreadPool,
+
+    /// Queue depth tracking for crypto pool (for metrics).
+    crypto_pending: Arc<AtomicUsize>,
+
+    /// Queue depth tracking for execution pool (for metrics).
+    execution_pending: Arc<AtomicUsize>,
 }
 
 impl ThreadPoolManager {
@@ -342,6 +349,8 @@ impl ThreadPoolManager {
             config,
             crypto_pool,
             execution_pool,
+            crypto_pending: Arc::new(AtomicUsize::new(0)),
+            execution_pending: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -448,21 +457,43 @@ impl ThreadPoolManager {
     /// Spawn a crypto verification task on the crypto pool.
     ///
     /// Returns immediately; the task runs asynchronously.
+    /// Queue depth is tracked for metrics.
     pub fn spawn_crypto<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
-        self.crypto_pool.spawn(f);
+        self.crypto_pending.fetch_add(1, Ordering::Relaxed);
+        let pending = self.crypto_pending.clone();
+        self.crypto_pool.spawn(move || {
+            f();
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
     }
 
     /// Spawn an execution task on the execution pool.
     ///
     /// Returns immediately; the task runs asynchronously.
+    /// Queue depth is tracked for metrics.
     pub fn spawn_execution<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
-        self.execution_pool.spawn(f);
+        self.execution_pending.fetch_add(1, Ordering::Relaxed);
+        let pending = self.execution_pending.clone();
+        self.execution_pool.spawn(move || {
+            f();
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Get current crypto pool queue depth (for metrics).
+    pub fn crypto_queue_depth(&self) -> usize {
+        self.crypto_pending.load(Ordering::Relaxed)
+    }
+
+    /// Get current execution pool queue depth (for metrics).
+    pub fn execution_queue_depth(&self) -> usize {
+        self.execution_pending.load(Ordering::Relaxed)
     }
 
     /// Install the crypto pool as the global rayon pool.

@@ -1193,8 +1193,16 @@ impl ExecutionState {
     fn handle_certificate_internal(&mut self, cert: StateCertificate) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = cert.transaction_hash;
+        let cert_shard = cert.shard_group_id;
 
+        let local_shard = self.local_shard();
         let Some(tracker) = self.certificate_trackers.get_mut(&tx_hash) else {
+            tracing::debug!(
+                tx_hash = ?tx_hash,
+                cert_shard = cert_shard.0,
+                local_shard = local_shard.0,
+                "No certificate tracker for tx, ignoring certificate"
+            );
             return actions;
         };
 
@@ -1204,6 +1212,7 @@ impl ExecutionState {
             tracing::debug!(
                 tx_hash = ?tx_hash,
                 shards = tracker.certificate_count(),
+                local_shard = local_shard.0,
                 "All certificates collected, creating TransactionCertificate"
             );
 
@@ -1212,6 +1221,13 @@ impl ExecutionState {
                 // Determine if transaction was accepted
                 let accepted = tx_cert.decision == TransactionDecision::Accept;
 
+                tracing::debug!(
+                    tx_hash = ?tx_hash,
+                    accepted = accepted,
+                    local_shard = local_shard.0,
+                    "TransactionCertificate created successfully"
+                );
+
                 // Store finalized certificate
                 self.finalized_certificates.insert(tx_hash, tx_cert);
 
@@ -1219,6 +1235,12 @@ impl ExecutionState {
                 actions.push(Action::EnqueueInternal {
                     event: Event::TransactionFinalized { tx_hash, accepted },
                 });
+            } else {
+                tracing::warn!(
+                    tx_hash = ?tx_hash,
+                    local_shard = local_shard.0,
+                    "Failed to create TransactionCertificate despite all certs collected"
+                );
             }
 
             // Remove tracker
@@ -1237,11 +1259,13 @@ impl ExecutionState {
         self.finalized_certificates.values().collect()
     }
 
-    /// Take all finalized certificates for block inclusion.
-    /// This removes them from the state, so they won't be included in multiple blocks.
-    pub fn take_finalized_certificates(&mut self) -> Vec<TransactionCertificate> {
-        std::mem::take(&mut self.finalized_certificates)
-            .into_values()
+    /// Get finalized certificates as a HashMap for block validation.
+    pub fn finalized_certificates_by_hash(
+        &self,
+    ) -> std::collections::HashMap<Hash, TransactionCertificate> {
+        self.finalized_certificates
+            .iter()
+            .map(|(h, c)| (*h, c.clone()))
             .collect()
     }
 
@@ -1341,7 +1365,6 @@ impl ExecutionState {
 
         // Phase 5: Certificate cleanup
         self.certificate_trackers.remove(tx_hash);
-        // Note: Don't remove finalized_certificates - those are ready for block inclusion
 
         // Early arrivals cleanup
         self.early_provisions.remove(tx_hash);

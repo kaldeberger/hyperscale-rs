@@ -446,9 +446,9 @@ impl SimulationRunner {
 
     /// Run simulation until no more events or time limit reached.
     pub fn run_until(&mut self, end_time: Duration) {
-        info!(
+        trace!(
             end_time_secs = end_time.as_secs_f64(),
-            "Starting simulation"
+            "Running simulation step"
         );
 
         while let Some((&key, _)) = self.event_queue.first_key_value() {
@@ -488,11 +488,11 @@ impl SimulationRunner {
             }
         }
 
-        info!(
+        trace!(
             events_processed = self.stats.events_processed,
             actions_generated = self.stats.actions_generated,
             final_time = ?self.now,
-            "Simulation complete"
+            "Simulation step complete"
         );
     }
 
@@ -946,21 +946,21 @@ impl SimulationRunner {
             // Storage reads - immediately return callback events in simulation
             // In production, these would be async operations
             Action::FetchStateEntries { tx_hash, nodes } => {
-                // In simulation, return empty entries (no persistent storage)
-                // A full implementation would read from SimStorage and return actual substates
+                // Fetch actual state entries from storage for provisioning
+                let storage = &self.node_storage[from as usize];
+                let executor = &self.node_executor[from as usize];
+                let entries = executor.fetch_state_entries(storage, &nodes);
                 trace!(
                     node = from,
                     tx_hash = ?tx_hash,
                     nodes = nodes.len(),
-                    "Fetching state entries (returning empty in simulation)"
+                    entries = entries.len(),
+                    "Fetching state entries from storage"
                 );
                 self.schedule_event(
                     from,
                     self.now,
-                    Event::StateEntriesFetched {
-                        tx_hash,
-                        entries: vec![], // Empty in simulation - no actual state
-                    },
+                    Event::StateEntriesFetched { tx_hash, entries },
                 );
             }
             Action::FetchBlock { height } => {

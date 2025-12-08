@@ -65,6 +65,9 @@ pub struct MempoolState {
 
     /// Network topology for shard-aware transaction routing.
     topology: Arc<dyn Topology>,
+
+    /// Current committed block height (for retry transaction creation).
+    current_height: BlockHeight,
 }
 
 impl MempoolState {
@@ -75,6 +78,7 @@ impl MempoolState {
             blocked_by: HashMap::new(),
             now: Duration::ZERO,
             topology,
+            current_height: BlockHeight(0),
         }
     }
 
@@ -179,6 +183,9 @@ impl MempoolState {
     pub fn on_block_committed_full(&mut self, block: &Block) -> Vec<Action> {
         let height = block.header.height;
         let mut actions = Vec::new();
+
+        // Track current height for retry creation
+        self.current_height = height;
 
         // 1. Mark transactions as committed
         for tx in &block.transactions {
@@ -318,8 +325,11 @@ impl MempoolState {
     /// Mark a transaction as finalized (execution complete).
     ///
     /// Called when ExecutionState creates a TransactionCertificate.
+    /// Also triggers retries for any transactions blocked by this winner.
     #[instrument(skip(self), fields(tx_hash = ?tx_hash, accepted = accepted))]
     pub fn on_transaction_finalized(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
+        let mut actions = Vec::new();
+
         if let Some(entry) = self.pool.get_mut(&tx_hash) {
             let decision = if accepted {
                 TransactionDecision::Accept
@@ -328,7 +338,58 @@ impl MempoolState {
             };
             entry.status = TransactionStatus::Finalized(decision);
         }
-        vec![]
+
+        // Check if any blocked transactions were waiting for this winner to finalize.
+        // This triggers retries immediately when the winner finalizes, rather than
+        // waiting for the certificate to be committed in a block.
+        let blocked_losers: Vec<_> = self
+            .blocked_by
+            .iter()
+            .filter(|(_, (_, winner))| *winner == tx_hash)
+            .map(|(loser_hash, (loser_tx, winner_hash))| {
+                (*loser_hash, loser_tx.clone(), *winner_hash)
+            })
+            .collect();
+
+        let height = self.current_height;
+        for (loser_hash, loser_tx, winner_hash) in blocked_losers {
+            // Create retry transaction
+            let retry_tx = loser_tx.create_retry(winner_hash, height);
+            let retry_hash = retry_tx.hash();
+
+            tracing::info!(
+                original = %loser_hash,
+                retry = %retry_hash,
+                winner = %winner_hash,
+                retry_count = retry_tx.retry_count(),
+                "Creating retry for blocked transaction (winner finalized)"
+            );
+
+            // Update original's status to Retried
+            if let Some(entry) = self.pool.get_mut(&loser_hash) {
+                entry.status = TransactionStatus::Retried { new_tx: retry_hash };
+            }
+
+            // Remove from blocked tracking
+            self.blocked_by.remove(&loser_hash);
+
+            // Add retry to mempool if not already present (dedup by hash)
+            if !self.pool.contains_key(&retry_hash) {
+                self.pool.insert(
+                    retry_hash,
+                    PoolEntry {
+                        tx: retry_tx.clone(),
+                        status: TransactionStatus::Pending,
+                        added_at: self.now,
+                    },
+                );
+
+                // Gossip the retry to relevant shards
+                actions.extend(self.broadcast_to_transaction_shards(&retry_tx));
+            }
+        }
+
+        actions
     }
 
     /// Mark a transaction as completed (certificate committed in block).

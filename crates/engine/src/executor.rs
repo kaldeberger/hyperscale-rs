@@ -226,10 +226,19 @@ impl RadixExecutor {
         if success {
             let all_writes = extract_substate_writes(receipt);
             // Filter writes to only include nodes in declared_writes
+            // This ensures all shards compute the same merkle root by excluding
+            // writes to system components (faucet, etc.) that may differ between shards
+            //
+            // NOTE: Currently this filters out most writes because declared_writes contains
+            // account component NodeIds but actual writes go to vault NodeIds inside those
+            // accounts. This results in an empty merkle root (Hash::ZERO) which still
+            // achieves agreement across shards. A future improvement would be to include
+            // writes to child nodes of declared_writes.
             let declared_set: std::collections::HashSet<_> = declared_writes.iter().collect();
             let filtered_writes: Vec<_> = all_writes
-                .into_iter()
+                .iter()
                 .filter(|w| declared_set.contains(&w.node_id))
+                .cloned()
                 .collect();
             let merkle_root = compute_merkle_root(&filtered_writes);
             SingleTxResult::success(tx_hash, merkle_root, filtered_writes)

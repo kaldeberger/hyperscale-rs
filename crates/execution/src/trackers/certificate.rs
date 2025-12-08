@@ -59,16 +59,36 @@ impl CertificateTracker {
         let shard = cert.shard_group_id;
 
         if !self.expected_shards.contains(&shard) {
+            tracing::debug!(
+                tx_hash = ?self.tx_hash,
+                shard = shard.0,
+                expected = ?self.expected_shards,
+                "Certificate from unexpected shard, ignoring"
+            );
             return false;
         }
 
         // Don't overwrite existing certificate
         if self.certificates.contains_key(&shard) {
+            tracing::debug!(
+                tx_hash = ?self.tx_hash,
+                shard = shard.0,
+                "Duplicate certificate from shard, ignoring"
+            );
             return self.is_complete();
         }
 
         self.certificates.insert(shard, cert);
-        self.is_complete()
+        let complete = self.is_complete();
+        tracing::debug!(
+            tx_hash = ?self.tx_hash,
+            shard = shard.0,
+            collected = self.certificates.len(),
+            expected = self.expected_shards.len(),
+            complete = complete,
+            "Added certificate from shard"
+        );
+        complete
     }
 
     /// Check if we have all expected certificates.
@@ -83,6 +103,12 @@ impl CertificateTracker {
     /// - Certificates have mismatched merkle roots (Byzantine behavior)
     pub fn create_tx_certificate(&self) -> Option<TransactionCertificate> {
         if !self.is_complete() {
+            tracing::debug!(
+                tx_hash = ?self.tx_hash,
+                collected = self.certificates.len(),
+                expected = self.expected_shards.len(),
+                "Cannot create TX certificate - not all certificates collected"
+            );
             return None;
         }
 
@@ -93,9 +119,19 @@ impl CertificateTracker {
             .map(|c| c.outputs_merkle_root)
             .collect();
         if !merkle_roots.windows(2).all(|w| w[0] == w[1]) {
-            tracing::warn!(tx_hash = ?self.tx_hash, "Merkle root mismatch across shards");
+            tracing::warn!(
+                tx_hash = ?self.tx_hash,
+                roots = ?merkle_roots,
+                "Merkle root mismatch across shards - cannot create TX certificate"
+            );
             return None;
         }
+
+        tracing::debug!(
+            tx_hash = ?self.tx_hash,
+            shards = ?self.certificates.keys().collect::<Vec<_>>(),
+            "Creating TX certificate - all certificates collected and merkle roots match"
+        );
 
         // Build shard proofs
         let mut shard_proofs = BTreeMap::new();

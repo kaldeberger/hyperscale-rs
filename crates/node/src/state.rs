@@ -342,14 +342,21 @@ impl StateMachine for NodeStateMachine {
                     30, // execution_timeout_blocks
                     3,  // max_retries
                 );
-                // Note: Certificates are NOT included directly in blocks for now.
-                // They need to be gossiped and collected by all validators first.
-                // This is a simplification - the full implementation would have
-                // validators fetch missing certificates before voting.
-                return self.bft.on_proposal_timer(&txs, deferred, aborted, vec![]);
+                // Get finalized certificates from execution state (cloned, not taken).
+                // Certificates are removed when they're committed in a block via
+                // on_block_committed, not when proposed.
+                let certificates: Vec<_> = self
+                    .execution
+                    .get_finalized_certificates()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                return self
+                    .bft
+                    .on_proposal_timer(&txs, deferred, aborted, certificates);
             }
 
-            // BlockHeaderReceived needs mempool for transaction lookup
+            // BlockHeaderReceived needs mempool for transaction lookup and certificates
             Event::BlockHeaderReceived {
                 header,
                 tx_hashes,
@@ -358,6 +365,7 @@ impl StateMachine for NodeStateMachine {
                 aborted,
             } => {
                 let mempool_txs = self.mempool.transactions_by_hash();
+                let local_certs = self.execution.finalized_certificates_by_hash();
                 return self.bft.on_block_header(
                     header.clone(),
                     tx_hashes.clone(),
@@ -365,6 +373,7 @@ impl StateMachine for NodeStateMachine {
                     deferred.clone(),
                     aborted.clone(),
                     &mempool_txs,
+                    &local_certs,
                 );
             }
 
@@ -379,14 +388,19 @@ impl StateMachine for NodeStateMachine {
                     30, // execution_timeout_blocks
                     3,  // max_retries
                 );
-                // Note: Certificates not included (see ProposalTimer comment)
+                let certificates: Vec<_> = self
+                    .execution
+                    .get_finalized_certificates()
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 return self.bft.on_qc_formed(
                     *block_hash,
                     qc.clone(),
                     &txs,
                     deferred,
                     aborted,
-                    vec![],
+                    certificates,
                 );
             }
 
@@ -431,6 +445,13 @@ impl StateMachine for NodeStateMachine {
                 // Cleanup execution state for aborted transactions
                 for abort in &block.aborted {
                     self.execution.cleanup_transaction(&abort.tx_hash);
+                }
+
+                // Remove committed certificates from execution state
+                // They've been included in this block, so don't need to be proposed again
+                for cert in &block.committed_certificates {
+                    self.execution
+                        .remove_finalized_certificate(&cert.transaction_hash);
                 }
 
                 // Pass transactions directly from block to execution (no need for mempool lookup)
@@ -488,11 +509,24 @@ impl StateMachine for NodeStateMachine {
                 return actions;
             }
 
-            // TransactionFinalized is emitted by execution, handled by mempool
-            Event::TransactionFinalized { .. } => {
-                if let Some(actions) = self.mempool.try_handle(&event) {
-                    return actions;
+            // TransactionFinalized is emitted by execution, handled by mempool AND BFT
+            // BFT might have pending blocks waiting for this certificate
+            Event::TransactionFinalized { tx_hash, .. } => {
+                let mut actions = vec![];
+
+                // Notify mempool
+                if let Some(mempool_actions) = self.mempool.try_handle(&event) {
+                    actions.extend(mempool_actions);
                 }
+
+                // Check if any pending blocks are now complete with this certificate
+                let local_certs = self.execution.finalized_certificates_by_hash();
+                actions.extend(
+                    self.bft
+                        .check_pending_blocks_for_certificate(*tx_hash, &local_certs),
+                );
+
+                return actions;
             }
 
             // TransactionGossipReceived: add to mempool AND notify BFT

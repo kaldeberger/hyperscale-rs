@@ -528,10 +528,49 @@ impl BftState {
             is_fallback: false,
         };
 
-        // Include certificates (limit by config)
+        // Collect certificate hashes from pending blocks that will commit before our new block.
+        // These blocks are at heights between committed_height+1 and next_height-1.
+        // When they commit, their certificates will be removed from local storage,
+        // so other validators won't be able to validate our block if it includes them.
+        let pending_commit_cert_hashes: std::collections::HashSet<Hash> = self
+            .pending_blocks
+            .values()
+            .filter(|pending| {
+                let h = pending.header().height.0;
+                h > self.committed_height && h < next_height
+            })
+            .filter_map(|pending| pending.block())
+            .flat_map(|block| {
+                block
+                    .committed_certificates
+                    .iter()
+                    .map(|c| c.transaction_hash)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Include certificates (limit by config), excluding those already in pending-commit blocks
         let committed_certificates: Vec<_> = certificates
             .into_iter()
+            .filter(|c| !pending_commit_cert_hashes.contains(&c.transaction_hash))
             .take(self.config.max_certificates_per_block)
+            .collect();
+
+        // Build set of certificate hashes being committed in this block
+        let cert_hash_set: std::collections::HashSet<Hash> = committed_certificates
+            .iter()
+            .map(|c| c.transaction_hash)
+            .collect();
+
+        // Filter out stale deferrals - those whose winner is being committed in this block.
+        // A deferral is "stale" if the winner TX already has a certificate in the same block,
+        // meaning the cycle has been resolved and the deferral is no longer needed.
+        let deferred_with_height: Vec<TransactionDefer> = deferred_with_height
+            .into_iter()
+            .filter(|d| {
+                let hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } = &d.reason;
+                !cert_hash_set.contains(winner_tx_hash)
+            })
             .collect();
 
         let block = Block {
@@ -689,12 +728,13 @@ impl BftState {
     /// Sender identity comes from the header's proposer field (ValidatorId),
     /// which is signed and verified. For sync detection, we don't need
     /// the network peer ID.
-    #[instrument(skip(self, header, tx_hashes, cert_hashes, deferred, aborted, mempool), fields(
+    #[instrument(skip(self, header, tx_hashes, cert_hashes, deferred, aborted, mempool, certificates), fields(
         height = header.height.0,
         round = header.round,
         proposer = ?header.proposer,
         tx_count = tx_hashes.len()
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn on_block_header(
         &mut self,
         header: BlockHeader,
@@ -703,6 +743,7 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         mempool: &HashMap<Hash, RoutableTransaction>,
+        certificates: &HashMap<Hash, TransactionCertificate>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height.0;
@@ -781,6 +822,13 @@ impl BftState {
             }
         }
 
+        // Try to fill in certificates from local certificate store
+        for cert_hash in &cert_hashes {
+            if let Some(cert) = certificates.get(cert_hash) {
+                pending.add_certificate(cert.clone());
+            }
+        }
+
         // Store pending block
         self.pending_blocks.insert(block_hash, pending);
 
@@ -838,13 +886,10 @@ impl BftState {
         }
 
         // If block is complete, construct it and proceed to voting (after QC verification)
-        let (is_complete, _missing_count) = {
-            let pending = self.pending_blocks.get(&block_hash);
-            match pending {
-                Some(p) => (p.is_complete(), p.missing_transaction_count()),
-                None => (false, 0),
-            }
-        };
+        let is_complete = self
+            .pending_blocks
+            .get(&block_hash)
+            .is_some_and(|p| p.is_complete());
 
         if is_complete {
             // Construct the block so it's available for commit later
@@ -2042,6 +2087,62 @@ impl BftState {
         actions
     }
 
+    /// Check if any pending blocks are now complete after a certificate was finalized.
+    ///
+    /// When a TransactionCertificate is finalized locally, it might complete a pending block
+    /// that was waiting for that certificate. This method checks all pending blocks and
+    /// triggers voting if any are now complete.
+    pub fn check_pending_blocks_for_certificate(
+        &mut self,
+        cert_hash: Hash,
+        certificates: &HashMap<Hash, TransactionCertificate>,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        // Find pending blocks that need this certificate
+        let block_hashes: Vec<Hash> = self
+            .pending_blocks
+            .iter()
+            .filter(|(_, pending)| pending.missing_certificates().contains(&cert_hash))
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        for block_hash in block_hashes {
+            if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
+                // Try to add the certificate
+                if let Some(cert) = certificates.get(&cert_hash) {
+                    pending.add_certificate(cert.clone());
+                }
+
+                // Check if block is now complete
+                if pending.is_complete() {
+                    let height = pending.header().height.0;
+                    let round = pending.header().round;
+
+                    // Construct block if needed
+                    if pending.block().is_none() {
+                        if let Err(e) = pending.construct_block() {
+                            warn!("Failed to construct block after cert arrival: {}", e);
+                            continue;
+                        }
+                    }
+
+                    debug!(
+                        validator = ?self.validator_id(),
+                        block_hash = ?block_hash,
+                        cert_hash = ?cert_hash,
+                        "Pending block completed after certificate finalized"
+                    );
+
+                    // Try to vote on the now-complete block
+                    actions.extend(self.try_vote_on_block(block_hash, height, round));
+                }
+            }
+        }
+
+        actions
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Cleanup
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2102,6 +2203,25 @@ impl BftState {
     pub fn voted_heights(&self) -> &HashMap<u64, (Hash, u64)> {
         &self.voted_heights
     }
+
+    /// Check if this node will propose at the next height.
+    ///
+    /// Returns true if:
+    /// 1. We are the proposer for the next height/round
+    /// 2. We haven't already voted at that height
+    ///
+    /// This is used to avoid destructively taking certificates from execution
+    /// state when we won't actually be proposing a block.
+    pub fn will_propose_next(&self) -> bool {
+        let next_height = self
+            .latest_qc
+            .as_ref()
+            .map(|qc| qc.height.0 + 1)
+            .unwrap_or(self.committed_height + 1);
+        let round = self.view;
+
+        self.should_propose(next_height, round) && !self.voted_heights.contains_key(&next_height)
+    }
 }
 
 impl SubStateMachine for BftState {
@@ -2125,6 +2245,7 @@ impl SubStateMachine for BftState {
                 deferred.clone(),
                 aborted.clone(),
                 &HashMap::new(), // In real usage, mempool would be passed
+                &HashMap::new(), // In real usage, certificates would be passed
             )),
             Event::BlockVoteReceived { vote } => Some(self.on_block_vote(vote.clone())),
             Event::QuorumCertificateFormed { block_hash, qc } => {
@@ -2385,6 +2506,7 @@ mod tests {
             vec![], // deferred
             vec![], // aborted
             &HashMap::new(),
+            &HashMap::new(), // certificates
         );
 
         // Should emit VerifyQcSignature action
@@ -2452,7 +2574,15 @@ mod tests {
         let block_hash = header.hash();
 
         // First, process header to trigger QC verification
-        let _ = state.on_block_header(header, vec![], vec![], vec![], vec![], &HashMap::new());
+        let _ = state.on_block_header(
+            header,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // Now simulate QC signature verified successfully
         let actions = state.on_qc_signature_verified(block_hash, true);
@@ -2521,7 +2651,15 @@ mod tests {
         let block_hash = header.hash();
 
         // Process header to add pending verification
-        let _ = state.on_block_header(header, vec![], vec![], vec![], vec![], &HashMap::new());
+        let _ = state.on_block_header(
+            header,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // Verify block is pending
         assert!(state.pending_blocks.contains_key(&block_hash));
@@ -2580,8 +2718,15 @@ mod tests {
         };
 
         // Process header
-        let actions =
-            state.on_block_header(header, vec![], vec![], vec![], vec![], &HashMap::new());
+        let actions = state.on_block_header(
+            header,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // Should NOT emit VerifyQcSignature (genesis QC)
         let has_verify_qc = actions

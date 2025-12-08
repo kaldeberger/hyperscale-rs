@@ -91,7 +91,15 @@ fn test_recovered_votes_prevent_equivocation() {
     let header_b_hash = header_b.hash();
 
     // Process this block - it should NOT result in a vote because we already voted at height 5
-    let actions = state.on_block_header(header_b, vec![], vec![], vec![], vec![], &HashMap::new());
+    let actions = state.on_block_header(
+        header_b,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     // Check that no vote was broadcast (BroadcastToShard with BlockVote)
     let voted = actions.iter().any(|a| {

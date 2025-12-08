@@ -1262,35 +1262,19 @@ fn test_execution_flow() {
 
     let node0 = runner.node(0).expect("Node 0 should exist");
 
-    // Transaction should be executed and finalized
-    assert!(
-        node0.execution().is_executed(&tx_hash),
-        "Transaction should be marked as executed"
-    );
-    assert!(
-        node0.execution().is_finalized(&tx_hash),
-        "Transaction should be finalized with a certificate"
-    );
+    // Check transaction completed the full execution flow.
+    // Status should be Completed (certificate was committed in a block).
+    let status = node0.mempool().status(&tx_hash);
+    println!("  Committed height: {}", node0.bft().committed_height());
+    println!("  Tx status: {:?}", status);
 
-    // Check finalized certificate
-    let certs = node0.execution().get_finalized_certificates();
-    let tx_cert = certs.iter().find(|c| c.transaction_hash == tx_hash);
+    // Transaction should reach Completed state (certificate committed in block).
+    // This is the terminal success state for the full execution flow:
+    // Pending → Accepted → Committed → Executing → Finalized → Completed
     assert!(
-        tx_cert.is_some(),
-        "Should have finalized certificate for transaction"
-    );
-
-    let cert = tx_cert.unwrap();
-    println!("  Certificate decision: {:?}", cert.decision);
-    println!("  Certificate shard count: {}", cert.shard_count());
-
-    // With real Radix Engine execution, mock test transactions are rejected
-    // (they have empty instructions and invalid signatures).
-    // The important thing is that the execution flow completed and produced a certificate.
-    // For tests that need Accept, use real signed transactions (see e2e_tests.rs).
-    assert!(
-        cert.is_accepted() || cert.is_rejected(),
-        "Transaction should have a decision (Accept or Reject)"
+        matches!(status, Some(hyperscale_types::TransactionStatus::Completed)),
+        "Transaction should be Completed (certificate committed), got {:?}",
+        status
     );
 }
 

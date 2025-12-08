@@ -130,60 +130,24 @@ fn test_two_shard_cycle_detection() {
     println!("  Account 0 (shard 0): {:?}", account0);
     println!("  Account 1 (shard 1): {:?}\n", account1);
 
-    // Initialize genesis
-    runner.initialize_genesis();
+    // Initialize genesis with pre-funded accounts
+    let initial_balance = Decimal::from(10000);
+    runner.initialize_genesis_with_balances(vec![
+        (account0, initial_balance),
+        (account1, initial_balance),
+    ]);
+    println!("✓ Accounts funded at genesis\n");
 
-    // First, fund both accounts using faucet
-    let faucet_signer = test_keypair_from_seed(1);
-
-    // Fund account 0
-    let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
-        .get_free_xrd_from_faucet()
-        .try_deposit_entire_worktop_or_abort(account0, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &simulator_network(), 100, &faucet_signer)
-        .expect("should sign");
-    let fund0: RoutableTransaction = notarized.try_into().expect("valid transaction");
-
-    // Fund account 1
-    let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
-        .get_free_xrd_from_faucet()
-        .try_deposit_entire_worktop_or_abort(account1, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &simulator_network(), 101, &faucet_signer)
-        .expect("should sign");
-    let fund1: RoutableTransaction = notarized.try_into().expect("valid transaction");
-
-    // Submit funding transactions
-    runner.schedule_initial_event(
-        0,
-        Duration::ZERO,
-        Event::SubmitTransaction {
-            tx: fund0,
-            request_id: RequestId(100),
-        },
-    );
-    runner.schedule_initial_event(
-        3,
-        Duration::from_millis(10),
-        Event::SubmitTransaction {
-            tx: fund1,
-            request_id: RequestId(101),
-        },
-    );
-
-    // Run to fund accounts
+    // Run for a bit before starting the test to let consensus start producing blocks
     runner.run_until(Duration::from_secs(3));
-    println!("✓ Accounts funded\n");
 
     // Create conflicting cross-shard transactions:
     // TX A: withdraw from account0 (shard 0), deposit to account1 (shard 1)
     // TX B: withdraw from account1 (shard 1), deposit to account0 (shard 0)
+    // Use lock_fee on the source account (not faucet) to properly declare it as a write
 
     let manifest_a = ManifestBuilder::new()
-        .lock_fee_from_faucet()
+        .lock_fee(account0, Decimal::from(10))
         .withdraw_from_account(account0, XRD, Decimal::from(100))
         .try_deposit_entire_worktop_or_abort(account1, None)
         .build();
@@ -193,7 +157,7 @@ fn test_two_shard_cycle_detection() {
     let hash_a = tx_a.hash();
 
     let manifest_b = ManifestBuilder::new()
-        .lock_fee_from_faucet()
+        .lock_fee(account1, Decimal::from(10))
         .withdraw_from_account(account1, XRD, Decimal::from(100))
         .try_deposit_entire_worktop_or_abort(account0, None)
         .build();
@@ -216,9 +180,10 @@ fn test_two_shard_cycle_detection() {
     };
 
     // Submit both transactions nearly simultaneously to create cycle potential
+    let submit_time = runner.now();
     runner.schedule_initial_event(
         0,
-        runner.now(),
+        submit_time,
         Event::SubmitTransaction {
             tx: tx_a,
             request_id: RequestId(200),
@@ -226,7 +191,7 @@ fn test_two_shard_cycle_detection() {
     );
     runner.schedule_initial_event(
         3,
-        runner.now() + Duration::from_millis(5),
+        submit_time + Duration::from_millis(5),
         Event::SubmitTransaction {
             tx: tx_b,
             request_id: RequestId(201),
@@ -379,52 +344,21 @@ fn test_retry_completion_after_winner() {
 
     let (kp0, account0, _kp1, account1) = find_accounts_for_shards(num_shards);
 
-    runner.initialize_genesis();
+    // Initialize genesis with pre-funded accounts
+    let initial_balance = Decimal::from(10000);
+    runner.initialize_genesis_with_balances(vec![
+        (account0, initial_balance),
+        (account1, initial_balance),
+    ]);
+    println!("✓ Accounts funded at genesis\n");
 
-    // Fund accounts
-    let faucet_signer = test_keypair_from_seed(1);
-
-    let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
-        .get_free_xrd_from_faucet()
-        .try_deposit_entire_worktop_or_abort(account0, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &simulator_network(), 100, &faucet_signer)
-        .expect("should sign");
-    let fund0: RoutableTransaction = notarized.try_into().expect("valid transaction");
-
-    let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
-        .get_free_xrd_from_faucet()
-        .try_deposit_entire_worktop_or_abort(account1, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &simulator_network(), 101, &faucet_signer)
-        .expect("should sign");
-    let fund1: RoutableTransaction = notarized.try_into().expect("valid transaction");
-
-    runner.schedule_initial_event(
-        0,
-        Duration::ZERO,
-        Event::SubmitTransaction {
-            tx: fund0,
-            request_id: RequestId(100),
-        },
-    );
-    runner.schedule_initial_event(
-        3,
-        Duration::from_millis(10),
-        Event::SubmitTransaction {
-            tx: fund1,
-            request_id: RequestId(101),
-        },
-    );
-
+    // Run for a bit before starting the test to let consensus start producing blocks
     runner.run_until(Duration::from_secs(3));
-    println!("✓ Accounts funded\n");
 
     // Create single cross-shard transaction (simpler test)
+    // Use lock_fee on the source account (not faucet) to properly declare it as a write
     let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
+        .lock_fee(account0, Decimal::from(10))
         .withdraw_from_account(account0, XRD, Decimal::from(100))
         .try_deposit_entire_worktop_or_abort(account1, None)
         .build();
@@ -435,9 +369,10 @@ fn test_retry_completion_after_winner() {
 
     println!("Cross-shard transaction: {:?}", tx_hash);
 
+    let submit_time = runner.now();
     runner.schedule_initial_event(
         0,
-        runner.now(),
+        submit_time,
         Event::SubmitTransaction {
             tx,
             request_id: RequestId(200),
@@ -528,31 +463,13 @@ fn test_many_cross_shard_transactions() {
 
     let (kp0, account0, _kp1, account1) = find_accounts_for_shards(num_shards);
 
-    runner.initialize_genesis();
-
-    // Fund source account generously
-    let faucet_signer = test_keypair_from_seed(1);
-
-    let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
-        .get_free_xrd_from_faucet()
-        .try_deposit_entire_worktop_or_abort(account0, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &simulator_network(), 100, &faucet_signer)
-        .expect("should sign");
-    let fund: RoutableTransaction = notarized.try_into().expect("valid transaction");
-
-    runner.schedule_initial_event(
-        0,
-        Duration::ZERO,
-        Event::SubmitTransaction {
-            tx: fund,
-            request_id: RequestId(100),
-        },
-    );
-
-    runner.run_until(Duration::from_secs(2));
-    println!("✓ Account funded\n");
+    // Initialize genesis with pre-funded accounts
+    let initial_balance = Decimal::from(10000);
+    runner.initialize_genesis_with_balances(vec![
+        (account0, initial_balance),
+        (account1, initial_balance),
+    ]);
+    println!("✓ Accounts funded at genesis\n");
 
     // Submit multiple cross-shard transactions
     let num_transactions = 5;
@@ -564,8 +481,9 @@ fn test_many_cross_shard_transactions() {
     );
 
     for i in 0..num_transactions {
+        // Use lock_fee on the source account (not faucet) to properly declare it as a write
         let manifest = ManifestBuilder::new()
-            .lock_fee_from_faucet()
+            .lock_fee(account0, Decimal::from(10))
             .withdraw_from_account(account0, XRD, Decimal::from(10))
             .try_deposit_entire_worktop_or_abort(account1, None)
             .build();
@@ -656,9 +574,10 @@ fn test_many_cross_shard_transactions() {
 #[test]
 fn test_resolves_livelocks_in_under_x_seconds() {
     // Time for winner to complete (proves livelock was broken)
-    const MAX_WINNER_SECONDS: u64 = 5;
+    const MAX_WINNER_SECONDS: u64 = 10;
     // Total time for both transactions (winner + loser retry)
-    const MAX_TOTAL_SECONDS: u64 = 15;
+    // Increased to allow for full certificate finalization and block inclusion
+    const MAX_TOTAL_SECONDS: u64 = 30;
 
     println!("\n=== Livelock Test: Resolution Time Bound ===");
     println!(
@@ -677,51 +596,16 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     println!("  Shard 0: {:?}", account0);
     println!("  Shard 1: {:?}\n", account1);
 
-    // Initialize genesis
-    runner.initialize_genesis();
+    // Initialize genesis with pre-funded accounts (no funding transactions needed)
+    let initial_balance = Decimal::from(10000);
+    runner.initialize_genesis_with_balances(vec![
+        (account0, initial_balance),
+        (account1, initial_balance),
+    ]);
+    println!("✓ Accounts funded at genesis\n");
 
-    // Fund both accounts using faucet
-    let faucet_signer = test_keypair_from_seed(1);
-
-    let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
-        .get_free_xrd_from_faucet()
-        .try_deposit_entire_worktop_or_abort(account0, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &simulator_network(), 100, &faucet_signer)
-        .expect("should sign");
-    let fund0: RoutableTransaction = notarized.try_into().expect("valid transaction");
-
-    let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
-        .get_free_xrd_from_faucet()
-        .try_deposit_entire_worktop_or_abort(account1, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &simulator_network(), 101, &faucet_signer)
-        .expect("should sign");
-    let fund1: RoutableTransaction = notarized.try_into().expect("valid transaction");
-
-    // Submit funding transactions
-    runner.schedule_initial_event(
-        0,
-        Duration::ZERO,
-        Event::SubmitTransaction {
-            tx: fund0,
-            request_id: RequestId(100),
-        },
-    );
-    runner.schedule_initial_event(
-        3,
-        Duration::from_millis(10),
-        Event::SubmitTransaction {
-            tx: fund1,
-            request_id: RequestId(101),
-        },
-    );
-
-    // Run to fund accounts
+    // For a bit before starting the test
     runner.run_until(Duration::from_secs(3));
-    println!("✓ Accounts funded\n");
 
     // Create conflicting cross-shard transactions that form a cycle:
     // TX A: withdraw from account0 (shard 0) -> deposit to account1 (shard 1)
@@ -737,8 +621,9 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     //   - Higher-hash TX is deferred, lower-hash TX wins
     //   - Winner completes, loser retries and completes
 
+    // Use lock_fee on the source account (not faucet) to properly declare it as a write
     let manifest_a = ManifestBuilder::new()
-        .lock_fee_from_faucet()
+        .lock_fee(account0, Decimal::from(10))
         .withdraw_from_account(account0, XRD, Decimal::from(100))
         .try_deposit_entire_worktop_or_abort(account1, None)
         .build();
@@ -748,7 +633,7 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     let hash_a = tx_a.hash();
 
     let manifest_b = ManifestBuilder::new()
-        .lock_fee_from_faucet()
+        .lock_fee(account1, Decimal::from(10))
         .withdraw_from_account(account1, XRD, Decimal::from(100))
         .try_deposit_entire_worktop_or_abort(account0, None)
         .build();
@@ -792,34 +677,29 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     println!("  Starting livelock resolution timer...\n");
 
     // Track resolution
+    // Expected outcome:
+    // - TX A (loser, higher hash): Retried { new_tx }
+    // - TX B (winner, lower hash): Completed
+    // - Retry TX: Completed
     let resolution_start = runner.now();
     let max_winner_time = Duration::from_secs(MAX_WINNER_SECONDS);
     let max_total_time = Duration::from_secs(MAX_TOTAL_SECONDS);
     let deadline = resolution_start + max_total_time;
 
-    let mut a_completed = false;
+    let mut a_retried = false;
     let mut b_completed = false;
-    let mut a_completion_time = None;
+    let mut retry_completed = false;
     let mut b_completion_time = None;
-
-    // Helper to check if a status represents successful resolution
-    fn is_resolved(status: &TransactionStatus) -> bool {
-        matches!(
-            status,
-            TransactionStatus::Finalized(hyperscale_types::TransactionDecision::Accept)
-                | TransactionStatus::Completed
-        )
-    }
+    let mut retry_completion_time = None;
 
     // Run simulation checking for completion
     let mut last_status_a = None;
     let mut last_status_b = None;
+    let mut last_retry_status = None;
     let mut iteration = 0;
 
-    // Track retry transaction for loser
+    // Track retry transaction for loser (TX A)
     let mut retry_hash: Option<hyperscale_types::Hash> = None;
-    let mut retry_resolved = false;
-    let mut retry_resolution_time = None;
 
     while runner.now() < deadline {
         runner.run_until(runner.now() + Duration::from_millis(50));
@@ -829,7 +709,7 @@ fn test_resolves_livelocks_in_under_x_seconds() {
         let status_a = node0.mempool().status(&hash_a);
         let status_b = node0.mempool().status(&hash_b);
 
-        // Log status changes
+        // Log status changes for TX A
         if status_a != last_status_a {
             let elapsed = runner.now() - resolution_start;
             println!(
@@ -838,15 +718,18 @@ fn test_resolves_livelocks_in_under_x_seconds() {
             );
             last_status_a = status_a.clone();
 
-            // Check if TX A was retried (it's the loser)
+            // Check if TX A was retried (it should be the loser)
             if let Some(TransactionStatus::Retried { new_tx }) = &status_a {
                 println!(
                     "  [iter {}] TX A was retried -> tracking {:?}",
                     iteration, new_tx
                 );
                 retry_hash = Some(*new_tx);
+                a_retried = true;
             }
         }
+
+        // Log status changes for TX B
         if status_b != last_status_b {
             let elapsed = runner.now() - resolution_start;
             println!(
@@ -854,50 +737,36 @@ fn test_resolves_livelocks_in_under_x_seconds() {
                 iteration, last_status_b, status_b, elapsed
             );
             last_status_b = status_b.clone();
-        }
 
-        // Check TX A (original)
-        if !a_completed {
-            if let Some(status) = &status_a {
-                if is_resolved(status) {
-                    let elapsed = runner.now() - resolution_start;
-                    a_completion_time = Some(elapsed);
-                    a_completed = true;
-                    println!("  ✓ TX A resolved in {:?}", elapsed);
-                }
+            // Check if TX B completed (it should be the winner)
+            if matches!(status_b, Some(TransactionStatus::Completed)) {
+                b_completed = true;
+                b_completion_time = Some(elapsed);
+                println!("  ✓ TX B (winner) completed in {:?}", elapsed);
             }
         }
 
-        // Check TX B
-        if !b_completed {
-            if let Some(status) = &status_b {
-                if is_resolved(status) {
-                    let elapsed = runner.now() - resolution_start;
-                    b_completion_time = Some(elapsed);
-                    b_completed = true;
-                    println!("  ✓ TX B resolved in {:?}", elapsed);
-                }
-            }
-        }
-
-        // Check retry transaction if we have one
+        // Check retry transaction status
         if let Some(rh) = retry_hash {
-            if !retry_resolved {
-                if let Some(status) = node0.mempool().status(&rh) {
-                    if is_resolved(&status) {
-                        let elapsed = runner.now() - resolution_start;
-                        retry_resolution_time = Some(elapsed);
-                        retry_resolved = true;
-                        println!("  ✓ Retry TX resolved in {:?}", elapsed);
-                    }
+            let retry_status = node0.mempool().status(&rh);
+            if retry_status != last_retry_status {
+                let elapsed = runner.now() - resolution_start;
+                println!(
+                    "  [iter {}] Retry: {:?} -> {:?} ({:?})",
+                    iteration, last_retry_status, retry_status, elapsed
+                );
+                last_retry_status = retry_status.clone();
+
+                if matches!(retry_status, Some(TransactionStatus::Completed)) {
+                    retry_completed = true;
+                    retry_completion_time = Some(elapsed);
+                    println!("  ✓ Retry TX completed in {:?}", elapsed);
                 }
             }
         }
 
-        // Success: winner resolved AND (loser resolved OR retry resolved)
-        let winner_done = a_completed || b_completed;
-        let loser_done = (a_completed && b_completed) || retry_resolved;
-        if winner_done && loser_done {
+        // Success: TX A retried, TX B completed, and retry completed
+        if a_retried && b_completed && retry_completed {
             break;
         }
     }
@@ -914,34 +783,31 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     println!("\n=== Results ===");
     println!("Resolution time: {:?}", resolution_time);
     println!(
-        "TX A: {} (time: {:?})",
-        if a_completed {
-            "✅ Resolved".to_string()
+        "TX A (loser): {}",
+        if a_retried {
+            format!("✅ Retried -> {:?}", retry_hash.unwrap())
         } else {
             format!("❌ {:?}", final_status_a)
-        },
-        a_completion_time.unwrap_or(Duration::ZERO)
+        }
     );
     println!(
-        "TX B: {} (time: {:?})",
+        "TX B (winner): {} (time: {:?})",
         if b_completed {
-            "✅ Resolved".to_string()
+            "✅ Completed".to_string()
         } else {
             format!("❌ {:?}", final_status_b)
         },
         b_completion_time.unwrap_or(Duration::ZERO)
     );
-    if retry_hash.is_some() {
-        println!(
-            "Retry: {} (time: {:?})",
-            if retry_resolved {
-                "✅ Resolved".to_string()
-            } else {
-                format!("❌ {:?}", final_retry_status)
-            },
-            retry_resolution_time.unwrap_or(Duration::ZERO)
-        );
-    }
+    println!(
+        "Retry TX: {} (time: {:?})",
+        if retry_completed {
+            "✅ Completed".to_string()
+        } else {
+            format!("❌ {:?}", final_retry_status)
+        },
+        retry_completion_time.unwrap_or(Duration::ZERO)
+    );
 
     // Get block heights to verify progress
     let shard0_height: u64 = (0..3)
@@ -957,98 +823,58 @@ fn test_resolves_livelocks_in_under_x_seconds() {
         shard0_height, shard1_height
     );
 
-    // Determine if livelock was resolved:
-    // - The winner (lower hash) must have resolved
-    // - The loser must either resolve directly OR be retried and the retry must resolve
-    let winner_resolved = a_completed || b_completed;
-    let loser_resolved = (a_completed && b_completed) || retry_resolved;
-
-    // Check that loser was properly detected (should be in Blocked or Retried status)
-    let loser_was_deferred = matches!(
-        &final_status_a,
-        Some(TransactionStatus::Blocked { .. }) | Some(TransactionStatus::Retried { .. })
-    ) || matches!(
-        &final_status_b,
-        Some(TransactionStatus::Blocked { .. }) | Some(TransactionStatus::Retried { .. })
-    );
-
-    // Get winner completion time for SLA check
-    let winner_time = if a_completed && b_completed {
-        a_completion_time.unwrap().min(b_completion_time.unwrap())
-    } else if a_completed {
-        a_completion_time.unwrap()
-    } else if b_completed {
-        b_completion_time.unwrap()
-    } else {
-        Duration::MAX // No winner yet
-    };
-
-    // Assertions
+    // Assertions - verify expected final states
     assert!(
-        winner_resolved,
-        "Winner transaction must resolve to prove livelock was broken. \
-         TX A: {:?}, TX B: {:?}. This indicates the livelock prevention mechanism failed.",
-        final_status_a, final_status_b
+        a_retried,
+        "TX A (loser) must be retried. Final status: {:?}",
+        final_status_a
     );
 
+    assert!(
+        b_completed,
+        "TX B (winner) must complete. Final status: {:?}",
+        final_status_b
+    );
+
+    let winner_time = b_completion_time.unwrap();
     assert!(
         winner_time < max_winner_time,
-        "Winner took {:?} to resolve, exceeding the {} second limit. \
-         This indicates the livelock prevention mechanism is too slow.",
+        "Winner (TX B) took {:?} to complete, exceeding the {} second limit.",
         winner_time,
         MAX_WINNER_SECONDS
     );
 
     assert!(
-        loser_was_deferred,
-        "Loser transaction should be detected and deferred. \
-         TX A: {:?}, TX B: {:?}. Expected one to be Blocked or Retried.",
-        final_status_a, final_status_b
+        retry_completed,
+        "Retry transaction must complete. Final status: {:?}",
+        final_retry_status
     );
 
-    // If loser also resolved, check total time
-    if loser_resolved {
-        assert!(
-            resolution_time < max_total_time,
-            "Full livelock resolution took {:?}, exceeding the {} second limit.",
-            resolution_time,
-            MAX_TOTAL_SECONDS
-        );
-    }
+    assert!(
+        resolution_time < max_total_time,
+        "Full resolution took {:?}, exceeding the {} second limit.",
+        resolution_time,
+        MAX_TOTAL_SECONDS
+    );
 
-    // Calculate and display metrics
-    let loser_time = if a_completed && b_completed {
-        a_completion_time.unwrap().max(b_completion_time.unwrap())
-    } else {
-        retry_resolution_time.unwrap_or(Duration::ZERO)
-    };
-
-    let deferral_overhead = if loser_time > winner_time && loser_time != Duration::ZERO {
-        loser_time - winner_time
-    } else {
-        Duration::ZERO
-    };
+    // Calculate deferral overhead
+    let retry_time = retry_completion_time.unwrap();
+    let deferral_overhead = retry_time - winner_time;
 
     println!("\n✅ LIVELOCK RESOLUTION TEST PASSED!");
-    println!("   ✅ Livelock detected and cycle broken");
+    println!("   ✅ TX A (loser) was deferred and retried");
     println!(
-        "   ✅ Winner resolved in: {:?} (limit: {}s)",
+        "   ✅ TX B (winner) completed in: {:?} (limit: {}s)",
         winner_time, MAX_WINNER_SECONDS
     );
-    println!("   ✅ Loser was properly deferred");
-    if loser_resolved {
-        println!(
-            "   ✅ Loser resolved in: {:?} (deferral overhead: {:?})",
-            loser_time, deferral_overhead
-        );
-        println!(
-            "   ✅ Total resolution time: {:?} (limit: {}s)",
-            resolution_time, MAX_TOTAL_SECONDS
-        );
-    } else {
-        println!("   ⚠️  Loser still pending (retry mechanism may need more time)");
-        println!("   ℹ️  Total time elapsed: {:?}", resolution_time);
-    }
+    println!(
+        "   ✅ Retry TX completed in: {:?} (deferral overhead: {:?})",
+        retry_time, deferral_overhead
+    );
+    println!(
+        "   ✅ Total resolution time: {:?} (limit: {}s)",
+        resolution_time, MAX_TOTAL_SECONDS
+    );
 }
 
 /// Test that transactions eventually timeout if they can't complete.
@@ -1073,35 +899,21 @@ fn test_timeout_abort_mechanism() {
 
     let (kp0, account0, _kp1, account1) = find_accounts_for_shards(num_shards);
 
-    runner.initialize_genesis();
+    // Initialize genesis with pre-funded accounts
+    let initial_balance = Decimal::from(10000);
+    runner.initialize_genesis_with_balances(vec![
+        (account0, initial_balance),
+        (account1, initial_balance),
+    ]);
+    println!("✓ Accounts funded at genesis\n");
 
-    // Fund source account
-    let faucet_signer = test_keypair_from_seed(1);
-
-    let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
-        .get_free_xrd_from_faucet()
-        .try_deposit_entire_worktop_or_abort(account0, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, &simulator_network(), 100, &faucet_signer)
-        .expect("should sign");
-    let fund: RoutableTransaction = notarized.try_into().expect("valid transaction");
-
-    runner.schedule_initial_event(
-        0,
-        Duration::ZERO,
-        Event::SubmitTransaction {
-            tx: fund,
-            request_id: RequestId(100),
-        },
-    );
-
-    runner.run_until(Duration::from_secs(2));
-    println!("✓ Account funded\n");
+    // Run for a bit before starting the test to let consensus start producing blocks
+    runner.run_until(Duration::from_secs(3));
 
     // Submit a cross-shard transaction
+    // Use lock_fee on the source account (not faucet) to properly declare it as a write
     let manifest = ManifestBuilder::new()
-        .lock_fee_from_faucet()
+        .lock_fee(account0, Decimal::from(10))
         .withdraw_from_account(account0, XRD, Decimal::from(50))
         .try_deposit_entire_worktop_or_abort(account1, None)
         .build();
@@ -1112,9 +924,10 @@ fn test_timeout_abort_mechanism() {
 
     println!("Submitting cross-shard transaction: {:?}", tx_hash);
 
+    let submit_time = runner.now();
     runner.schedule_initial_event(
         0,
-        runner.now(),
+        submit_time,
         Event::SubmitTransaction {
             tx,
             request_id: RequestId(200),

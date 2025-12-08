@@ -129,9 +129,6 @@ fn main() {
     let total_duration = Duration::from_secs(args.duration + args.ramp_down);
     let report = simulator.run_for(total_duration);
 
-    // Print report
-    report.print_summary();
-
     // Print summary
     println!("\n=== Simulation Complete ===");
     println!("Submitted:  {}", report.total_submitted);

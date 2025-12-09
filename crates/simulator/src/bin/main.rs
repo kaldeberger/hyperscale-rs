@@ -137,7 +137,7 @@ fn main() {
     // Print summary
     println!("\n=== Simulation Complete ===");
     println!("Submitted:  {}", report.total_submitted);
-    println!("Finalized:  {}", report.total_finalized);
+    println!("Completed:  {}", report.total_completed);
     println!("Rejected:   {}", report.total_rejected);
     println!("In-flight:  {}", report.in_flight_at_end);
     println!("TPS:        {:.2}", report.average_tps);

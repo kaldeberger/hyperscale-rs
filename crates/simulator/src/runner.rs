@@ -245,8 +245,9 @@ impl Simulator {
                     if let Some(status) = node.mempool().status(&hash) {
                         match status {
                             TransactionStatus::Completed => {
+                                // Transaction fully executed - record completion and latency
                                 let latency = current_time.saturating_sub(submit_time);
-                                self.metrics.record_finalization(latency);
+                                self.metrics.record_completion(latency);
                                 self.in_flight.remove(&hash);
                                 debug!(
                                     ?hash,
@@ -254,17 +255,8 @@ impl Simulator {
                                     "Transaction completed"
                                 );
                             }
-                            TransactionStatus::Finalized(TransactionDecision::Accept) => {
-                                let latency = current_time.saturating_sub(submit_time);
-                                self.metrics.record_finalization(latency);
-                                self.in_flight.remove(&hash);
-                                debug!(
-                                    ?hash,
-                                    latency_ms = latency.as_millis(),
-                                    "Transaction finalized (accept)"
-                                );
-                            }
                             TransactionStatus::Finalized(TransactionDecision::Reject) => {
+                                // Transaction was rejected - record rejection (no latency)
                                 self.metrics.record_rejection();
                                 self.in_flight.remove(&hash);
                                 debug!(?hash, "Transaction rejected");
@@ -276,7 +268,7 @@ impl Simulator {
                                 debug!(?hash, ?new_tx, "Transaction retried");
                             }
                             _ => {
-                                // Still in progress
+                                // Still in progress (Pending, Blocked, Committed, Finalized(Accept), etc.)
                             }
                         }
                     }
@@ -308,12 +300,12 @@ impl Simulator {
 
     /// Log progress during simulation.
     fn log_progress(&mut self, start_time: Duration, end_time: Duration) {
-        let (submitted, finalized, rejected) = self.metrics.current_stats();
+        let (submitted, completed, rejected) = self.metrics.current_stats();
         let elapsed = self.runner.now() - start_time;
         let remaining = end_time.saturating_sub(self.runner.now());
 
         let tps = if elapsed.as_secs_f64() > 0.0 {
-            finalized as f64 / elapsed.as_secs_f64()
+            completed as f64 / elapsed.as_secs_f64()
         } else {
             0.0
         };
@@ -329,7 +321,7 @@ impl Simulator {
             elapsed_secs = elapsed.as_secs(),
             remaining_secs = remaining.as_secs(),
             submitted,
-            finalized,
+            completed,
             rejected,
             in_flight = self.in_flight.len(),
             tps = format!("{:.2}", tps),

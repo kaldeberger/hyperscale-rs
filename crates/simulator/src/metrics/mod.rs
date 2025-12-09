@@ -11,8 +11,8 @@ pub struct MetricsCollector {
     /// Submission count.
     submissions: u64,
 
-    /// Finalization count.
-    finalizations: u64,
+    /// Completion count (transactions fully executed).
+    completions: u64,
 
     /// Rejection count.
     rejections: u64,
@@ -35,8 +35,8 @@ pub struct MetricsCollector {
     /// Last sample time.
     last_sample_time: Duration,
 
-    /// Finalizations at last sample.
-    last_sample_finalizations: u64,
+    /// Completions at last sample.
+    last_sample_completions: u64,
 
     // Lock contention tracking
     /// Peak locked nodes observed.
@@ -57,7 +57,7 @@ impl MetricsCollector {
     pub fn new(start_time: Duration) -> Self {
         Self {
             submissions: 0,
-            finalizations: 0,
+            completions: 0,
             rejections: 0,
             latency_histogram: Histogram::new(3).expect("histogram creation should succeed"),
             start_time,
@@ -65,7 +65,7 @@ impl MetricsCollector {
             peak_tps: 0.0,
             samples: Vec::new(),
             last_sample_time: start_time,
-            last_sample_finalizations: 0,
+            last_sample_completions: 0,
             peak_locked_nodes: 0,
             peak_blocked: 0,
             peak_contention_ratio: 0.0,
@@ -83,9 +83,9 @@ impl MetricsCollector {
         self.submissions += count;
     }
 
-    /// Record a transaction finalization with its latency.
-    pub fn record_finalization(&mut self, latency: Duration) {
-        self.finalizations += 1;
+    /// Record a transaction completion with its latency.
+    pub fn record_completion(&mut self, latency: Duration) {
+        self.completions += 1;
         // Store latency in microseconds for better resolution
         let latency_us = latency.as_micros() as u64;
         let _ = self.latency_histogram.record(latency_us);
@@ -116,13 +116,13 @@ impl MetricsCollector {
         lock_stats: LockContentionStats,
     ) {
         let elapsed_since_last = current_time.saturating_sub(self.last_sample_time);
-        let finalizations_since_last = self
-            .finalizations
-            .saturating_sub(self.last_sample_finalizations);
+        let completions_since_last = self
+            .completions
+            .saturating_sub(self.last_sample_completions);
 
         // Calculate instantaneous TPS
         let instant_tps = if elapsed_since_last.as_secs_f64() > 0.0 {
-            finalizations_since_last as f64 / elapsed_since_last.as_secs_f64()
+            completions_since_last as f64 / elapsed_since_last.as_secs_f64()
         } else {
             0.0
         };
@@ -147,7 +147,7 @@ impl MetricsCollector {
         self.samples.push(MetricsSample {
             time: current_time,
             submissions: self.submissions,
-            finalizations: self.finalizations,
+            completions: self.completions,
             rejections: self.rejections,
             in_flight,
             instant_tps,
@@ -157,12 +157,12 @@ impl MetricsCollector {
         });
 
         self.last_sample_time = current_time;
-        self.last_sample_finalizations = self.finalizations;
+        self.last_sample_completions = self.completions;
     }
 
-    /// Current raw stats.
+    /// Current raw stats: (submitted, completed, rejected).
     pub fn current_stats(&self) -> (u64, u64, u64) {
-        (self.submissions, self.finalizations, self.rejections)
+        (self.submissions, self.completions, self.rejections)
     }
 
     /// Finalize and generate a report.
@@ -173,16 +173,16 @@ impl MetricsCollector {
             .map(|t| t.saturating_sub(self.start_time))
             .unwrap_or(total_duration);
 
-        // Calculate TPS based on submission duration (not total including ramp-down)
+        // Calculate TPS based on submission duration
         let average_tps = if submission_duration.as_secs_f64() > 0.0 {
-            self.finalizations as f64 / submission_duration.as_secs_f64()
+            self.completions as f64 / submission_duration.as_secs_f64()
         } else {
             0.0
         };
 
         SimulationReport {
             total_submitted: self.submissions,
-            total_finalized: self.finalizations,
+            total_completed: self.completions,
             total_rejected: self.rejections,
             in_flight_at_end: self.in_flight_at_end,
             average_tps,
@@ -205,8 +205,8 @@ pub struct MetricsSample {
     pub time: Duration,
     /// Cumulative submissions at this point.
     pub submissions: u64,
-    /// Cumulative finalizations at this point.
-    pub finalizations: u64,
+    /// Cumulative completions at this point.
+    pub completions: u64,
     /// Cumulative rejections at this point.
     pub rejections: u64,
     /// Transactions in flight at this point.
@@ -225,8 +225,8 @@ pub struct MetricsSample {
 pub struct SimulationReport {
     /// Total transactions submitted.
     pub total_submitted: u64,
-    /// Total transactions finalized successfully.
-    pub total_finalized: u64,
+    /// Total transactions completed (fully executed).
+    pub total_completed: u64,
     /// Total transactions rejected.
     pub total_rejected: u64,
     /// Transactions still in-flight at simulation end.
@@ -282,12 +282,12 @@ impl SimulationReport {
         Duration::from_micros(self.latency_histogram.min())
     }
 
-    /// Rejection rate (rejected / (finalized + rejected)).
-    /// This is the meaningful failure rate - how many completed transactions failed.
+    /// Rejection rate (rejected / (completed + rejected)).
+    /// This is the meaningful failure rate - how many decided transactions failed.
     pub fn rejection_rate(&self) -> f64 {
-        let completed = self.total_finalized + self.total_rejected;
-        if completed > 0 {
-            self.total_rejected as f64 / completed as f64
+        let decided = self.total_completed + self.total_rejected;
+        if decided > 0 {
+            self.total_rejected as f64 / decided as f64
         } else {
             0.0
         }
@@ -301,7 +301,7 @@ impl SimulationReport {
         println!();
         println!("Transactions:");
         println!("  Submitted:  {}", self.total_submitted);
-        println!("  Finalized:  {}", self.total_finalized);
+        println!("  Completed:  {}", self.total_completed);
         println!("  Rejected:   {}", self.total_rejected);
         println!("  In-flight:  {} (at cutoff)", self.in_flight_at_end);
         println!();
@@ -309,7 +309,7 @@ impl SimulationReport {
         println!("  Average TPS: {:.2}", self.average_tps);
         println!("  Peak TPS:    {:.2}", self.peak_tps);
         println!();
-        println!("Latency (finalized txs):");
+        println!("Latency (completed txs):");
         println!("  P50:  {:?}", self.p50_latency());
         println!("  P90:  {:?}", self.p90_latency());
         println!("  P99:  {:?}", self.p99_latency());
@@ -340,7 +340,7 @@ mod tests {
         // Simulate some transactions
         for i in 0..100 {
             collector.record_submission();
-            collector.record_finalization(Duration::from_millis(10 + i % 50));
+            collector.record_completion(Duration::from_millis(10 + i % 50));
         }
         collector.record_rejection();
 
@@ -348,7 +348,7 @@ mod tests {
         let report = collector.finalize(Duration::from_secs(12));
 
         assert_eq!(report.total_submitted, 100);
-        assert_eq!(report.total_finalized, 100);
+        assert_eq!(report.total_completed, 100);
         assert_eq!(report.total_rejected, 1);
         assert!(report.average_tps > 0.0);
     }

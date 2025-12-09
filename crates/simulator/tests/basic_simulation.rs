@@ -40,7 +40,7 @@ fn test_single_shard_simulation() {
     // Verify we processed some transactions
     println!("\n=== Test Results ===");
     println!("Submitted: {}", report.total_submitted);
-    println!("Finalized: {}", report.total_finalized);
+    println!("Completed: {}", report.total_completed);
     println!("Rejected:  {}", report.total_rejected);
     println!("TPS:       {:.2}", report.average_tps);
 
@@ -49,9 +49,8 @@ fn test_single_shard_simulation() {
         "Should have submitted transactions"
     );
 
-    // With a well-configured simulation, most transactions should complete
-    // (may not be 100% if simulation time is too short for ramp-down)
-    let completion_rate = report.total_finalized as f64 / report.total_submitted as f64;
+    // With a well-configured simulation, some transactions should complete
+    let completion_rate = report.total_completed as f64 / report.total_submitted as f64;
     println!("Completion rate: {:.2}%", completion_rate * 100.0);
 
     // Account usage should be relatively even with NoContention mode
@@ -87,7 +86,7 @@ fn test_multi_shard_simulation() {
 
     println!("\n=== Multi-Shard Test Results ===");
     println!("Submitted: {}", report.total_submitted);
-    println!("Finalized: {}", report.total_finalized);
+    println!("Completed: {}", report.total_completed);
     println!("TPS:       {:.2}", report.average_tps);
     println!("P50:       {:?}", report.p50_latency());
     println!("P99:       {:?}", report.p99_latency());
@@ -130,8 +129,8 @@ fn test_determinism() {
         "Submissions should be deterministic"
     );
     assert_eq!(
-        report1.total_finalized, report2.total_finalized,
-        "Finalizations should be deterministic"
+        report1.total_completed, report2.total_completed,
+        "Completions should be deterministic"
     );
     assert_eq!(
         report1.total_rejected, report2.total_rejected,
@@ -140,5 +139,5 @@ fn test_determinism() {
 
     println!("Determinism verified: both runs produced identical results");
     println!("  Submitted: {}", report1.total_submitted);
-    println!("  Finalized: {}", report1.total_finalized);
+    println!("  Completed: {}", report1.total_completed);
 }

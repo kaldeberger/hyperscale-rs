@@ -486,6 +486,18 @@ impl SimulationRunner {
             for action in actions {
                 self.process_action(node_index, action);
             }
+
+            // If this node is syncing, check if more blocks can be fetched from peers.
+            // This handles the case where sync was triggered before target blocks were
+            // available on peers. As other nodes commit blocks and broadcast headers,
+            // new blocks become available for sync.
+            let node = &self.nodes[node_index as usize];
+            if let Some(sync_target) = node.sync().sync_target() {
+                let current_height = node.bft().committed_height();
+                if current_height < sync_target {
+                    self.handle_sync_needed(node_index, sync_target);
+                }
+            }
         }
 
         trace!(
@@ -915,6 +927,18 @@ impl SimulationRunner {
                 }
                 // Prune old votes - we no longer need votes at or below committed height
                 storage.prune_own_votes(height.0);
+
+                // If this node is syncing, try to fetch more blocks that may now be available.
+                // This handles the case where sync was triggered before all target blocks
+                // were committed on peers.
+                let node_state = &self.nodes[from as usize];
+                if let Some(sync_target) = node_state.sync().sync_target() {
+                    let current_height = node_state.bft().committed_height();
+                    if current_height < sync_target {
+                        // Still need to sync more blocks - retry fetching
+                        self.handle_sync_needed(from, sync_target);
+                    }
+                }
             }
             Action::PersistTransactionCertificate { certificate } => {
                 // Store certificate AND commit state writes in this node's storage

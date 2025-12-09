@@ -756,23 +756,37 @@ impl BftState {
 
         // Check if this header reveals we're significantly behind and need to sync.
         // The parent_qc certifies block at height N-1 for a block at height N.
-        // If parent_qc.height > committed_height + 1, we're more than 1 block behind
-        // and can't catch up through normal consensus - we need to sync.
         //
-        // Being 1 block behind is normal - we just need to commit the next block through
-        // normal consensus. But being 2+ blocks behind means we can't participate.
+        // IMPORTANT: We use the maximum of committed_height and latest_qc height to
+        // determine our "known" height. This is critical because:
+        // - When we form a QC for block N, it commits block N-1 (two-chain rule)
+        // - But the commit is processed asynchronously, so committed_height may lag
+        // - If we only check committed_height, we may incorrectly trigger sync
+        //   when receiving proposals that build on our latest_qc
+        //
+        // We can participate in consensus for blocks up to latest_qc.height + 2:
+        // - latest_qc certifies height N
+        // - We can vote on height N+1 (extends latest_qc)
+        // - We can receive proposals for height N+2 (which reference N+1's QC once formed)
         if !header.parent_qc.is_genesis() {
             let parent_height = header.parent_qc.height.0;
-            // We can only vote on block N if we've committed block N-1 (parent)
-            // So if parent_height > committed_height, we need to catch up first
-            // But only trigger sync if we're MORE than 1 behind (can't catch up through normal means)
-            if parent_height > self.committed_height + 1 {
+            // Use the highest certified height we know about, not just committed height
+            let our_known_height = self
+                .latest_qc
+                .as_ref()
+                .map(|qc| qc.height.0)
+                .unwrap_or(0)
+                .max(self.committed_height);
+            // Only trigger sync if parent_qc references a height beyond what we can reach
+            // through normal consensus (our_known_height + 1)
+            if parent_height > our_known_height + 1 {
                 let target_height = parent_height;
                 let target_hash = header.parent_qc.block_hash;
 
                 info!(
                     validator = ?self.validator_id(),
-                    our_height = self.committed_height,
+                    our_committed_height = self.committed_height,
+                    our_known_height = our_known_height,
                     target_height = target_height,
                     "Detected we're significantly behind, triggering sync"
                 );

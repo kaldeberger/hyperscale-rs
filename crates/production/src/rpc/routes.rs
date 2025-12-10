@@ -35,6 +35,7 @@ fn api_v1_routes() -> Router<RpcState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::{MempoolSnapshot, TransactionStatusCache};
     use axum::{body::Body, http::Request};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -57,6 +58,8 @@ mod tests {
             })),
             tx_sender,
             start_time: Instant::now(),
+            tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
+            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
         }
     }
 

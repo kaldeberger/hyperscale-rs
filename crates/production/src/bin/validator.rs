@@ -757,7 +757,10 @@ async fn main() -> Result<()> {
 
     // Wire up RPC status updates if RPC server is enabled
     if let Some(ref handle) = rpc_handle {
-        runner_builder = runner_builder.rpc_status(handle.node_status().clone());
+        runner_builder = runner_builder
+            .rpc_status(handle.node_status().clone())
+            .tx_status_cache(handle.tx_status_cache().clone())
+            .mempool_snapshot(handle.mempool_snapshot().clone());
     }
 
     let mut runner = runner_builder

@@ -214,9 +214,20 @@ pub enum Action {
         result: TransactionDecision,
     },
 
-    /// Emit transaction status to the client.
+    /// Emit transaction status update for RPC status cache.
+    ///
+    /// Emitted by the mempool whenever a transaction's status changes:
+    /// - Pending: Transaction accepted into mempool
+    /// - Committed: Transaction included in a committed block
+    /// - Executed: Transaction execution complete (accept/reject decision made)
+    /// - Completed: Transaction certificate committed, can be evicted
+    /// - Blocked: Transaction deferred due to cross-shard livelock
+    /// - Retried: Transaction superseded by retry transaction
+    ///
+    /// The production runner updates the RPC status cache when processing
+    /// this action, allowing clients to query transaction status via the
+    /// `GET /api/v1/transactions/{hash}` endpoint.
     EmitTransactionStatus {
-        request_id: RequestId,
         tx_hash: Hash,
         status: TransactionStatus,
     },

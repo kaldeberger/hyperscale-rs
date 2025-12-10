@@ -1,6 +1,6 @@
 //! RPC server implementation.
 
-use super::handlers::{NodeStatusState, RpcState};
+use super::handlers::{MempoolSnapshot, NodeStatusState, RpcState, TransactionStatusCache};
 use super::routes::create_router;
 use crate::sync::SyncStatus;
 use hyperscale_types::RoutableTransaction;
@@ -48,6 +48,10 @@ pub struct RpcServerHandle {
     sync_status: Arc<RwLock<SyncStatus>>,
     /// Node status provider for updates.
     node_status: Arc<RwLock<NodeStatusState>>,
+    /// Transaction status cache for updates.
+    tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
+    /// Mempool snapshot for updates.
+    mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
 }
 
 impl RpcServerHandle {
@@ -64,6 +68,16 @@ impl RpcServerHandle {
     /// Get a reference to the node status for updates.
     pub fn node_status(&self) -> &Arc<RwLock<NodeStatusState>> {
         &self.node_status
+    }
+
+    /// Get a reference to the transaction status cache for updates.
+    pub fn tx_status_cache(&self) -> &Arc<RwLock<TransactionStatusCache>> {
+        &self.tx_status_cache
+    }
+
+    /// Get a reference to the mempool snapshot for updates.
+    pub fn mempool_snapshot(&self) -> &Arc<RwLock<MempoolSnapshot>> {
+        &self.mempool_snapshot
     }
 
     /// Abort the server.
@@ -97,6 +111,8 @@ impl RpcServer {
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
             tx_sender,
             start_time: Instant::now(),
+            tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
+            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
         };
 
         Self { config, state }
@@ -111,6 +127,8 @@ impl RpcServer {
         sync_status: Arc<RwLock<SyncStatus>>,
         node_status: Arc<RwLock<NodeStatusState>>,
         tx_sender: mpsc::Sender<RoutableTransaction>,
+        tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
+        mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
     ) -> Self {
         let state = RpcState {
             ready,
@@ -118,6 +136,8 @@ impl RpcServer {
             node_status,
             tx_sender,
             start_time: Instant::now(),
+            tx_status_cache,
+            mempool_snapshot,
         };
 
         Self { config, state }
@@ -129,6 +149,8 @@ impl RpcServer {
         let ready_flag = self.state.ready.clone();
         let sync_status = self.state.sync_status.clone();
         let node_status = self.state.node_status.clone();
+        let tx_status_cache = self.state.tx_status_cache.clone();
+        let mempool_snapshot = self.state.mempool_snapshot.clone();
 
         let router = create_router(self.state);
 
@@ -146,6 +168,8 @@ impl RpcServer {
             ready_flag,
             sync_status,
             node_status,
+            tx_status_cache,
+            mempool_snapshot,
         })
     }
 

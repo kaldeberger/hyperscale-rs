@@ -907,12 +907,8 @@ impl SimulationRunner {
                 debug!(?request_id, ?result, "Transaction result");
             }
 
-            Action::EmitTransactionStatus {
-                request_id,
-                tx_hash,
-                status,
-            } => {
-                debug!(?request_id, ?tx_hash, ?status, "Transaction status");
+            Action::EmitTransactionStatus { tx_hash, status } => {
+                debug!(?tx_hash, ?status, "Transaction status");
             }
 
             // Storage writes - store in SimStorage

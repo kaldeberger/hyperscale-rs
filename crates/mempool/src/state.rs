@@ -94,7 +94,6 @@ impl MempoolState {
         // Check for duplicate
         if self.pool.contains_key(&hash) {
             return vec![Action::EmitTransactionStatus {
-                request_id,
                 tx_hash: hash,
                 status: TransactionStatus::Pending, // Already exists
             }];
@@ -120,7 +119,6 @@ impl MempoolState {
         actions.extend(self.broadcast_to_transaction_shards(&tx));
 
         actions.push(Action::EmitTransactionStatus {
-            request_id,
             tx_hash: hash,
             status: TransactionStatus::Pending,
         });
@@ -208,6 +206,10 @@ impl MempoolState {
                 // Transition to a terminal state (we don't have an Aborted status,
                 // so we'll use Completed for now - the abort info is in the block)
                 entry.status = TransactionStatus::Completed;
+                actions.push(Action::EmitTransactionStatus {
+                    tx_hash: abort.tx_hash,
+                    status: TransactionStatus::Completed,
+                });
             }
         }
 
@@ -238,11 +240,16 @@ impl MempoolState {
                     from = %entry.status,
                     "Transaction deferred due to livelock cycle"
                 );
-                entry.status = new_status;
+                entry.status = new_status.clone();
 
                 // Track for retry when winner completes
                 self.blocked_by
                     .insert(tx_hash, (entry.tx.clone(), *winner_tx_hash));
+
+                return vec![Action::EmitTransactionStatus {
+                    tx_hash,
+                    status: new_status,
+                }];
             }
         }
 
@@ -258,6 +265,10 @@ impl MempoolState {
         // Mark the certificate's TX as completed
         if let Some(entry) = self.pool.get_mut(&tx_hash) {
             entry.status = TransactionStatus::Completed;
+            actions.push(Action::EmitTransactionStatus {
+                tx_hash,
+                status: TransactionStatus::Completed,
+            });
         }
 
         // Check if any blocked TXs were waiting for this winner
@@ -286,6 +297,10 @@ impl MempoolState {
             // Update original's status to Retried
             if let Some(entry) = self.pool.get_mut(&loser_hash) {
                 entry.status = TransactionStatus::Retried { new_tx: retry_hash };
+                actions.push(Action::EmitTransactionStatus {
+                    tx_hash: loser_hash,
+                    status: TransactionStatus::Retried { new_tx: retry_hash },
+                });
             }
 
             // Remove from blocked tracking
@@ -301,6 +316,12 @@ impl MempoolState {
                         added_at: self.now,
                     },
                 );
+
+                // Emit status for retry transaction
+                actions.push(Action::EmitTransactionStatus {
+                    tx_hash: retry_hash,
+                    status: TransactionStatus::Pending,
+                });
 
                 // Gossip the retry to relevant shards
                 actions.extend(self.broadcast_to_transaction_shards(&retry_tx));
@@ -335,6 +356,10 @@ impl MempoolState {
                 TransactionDecision::Reject
             };
             entry.status = TransactionStatus::Executed(decision);
+            actions.push(Action::EmitTransactionStatus {
+                tx_hash,
+                status: TransactionStatus::Executed(decision),
+            });
         }
 
         // Check if any blocked transactions were waiting for this winner to complete.
@@ -366,6 +391,10 @@ impl MempoolState {
             // Update original's status to Retried
             if let Some(entry) = self.pool.get_mut(&loser_hash) {
                 entry.status = TransactionStatus::Retried { new_tx: retry_hash };
+                actions.push(Action::EmitTransactionStatus {
+                    tx_hash: loser_hash,
+                    status: TransactionStatus::Retried { new_tx: retry_hash },
+                });
             }
 
             // Remove from blocked tracking
@@ -382,6 +411,12 @@ impl MempoolState {
                     },
                 );
 
+                // Emit status for retry transaction
+                actions.push(Action::EmitTransactionStatus {
+                    tx_hash: retry_hash,
+                    status: TransactionStatus::Pending,
+                });
+
                 // Gossip the retry to relevant shards
                 actions.extend(self.broadcast_to_transaction_shards(&retry_tx));
             }
@@ -393,17 +428,24 @@ impl MempoolState {
     /// Mark a transaction as completed (certificate committed in block).
     ///
     /// This is the terminal state - the transaction can be evicted from mempool.
-    pub fn mark_completed(&mut self, tx_hash: &Hash) {
+    pub fn mark_completed(&mut self, tx_hash: &Hash) -> Vec<Action> {
         if let Some(entry) = self.pool.get_mut(tx_hash) {
             entry.status = TransactionStatus::Completed;
+            return vec![Action::EmitTransactionStatus {
+                tx_hash: *tx_hash,
+                status: TransactionStatus::Completed,
+            }];
         }
+        vec![]
     }
 
     /// Update transaction status to a new state.
     ///
     /// This is used by the execution state machine to update status during
     /// the transaction lifecycle (Committed, Executed, etc.).
-    pub fn update_status(&mut self, tx_hash: &Hash, new_status: TransactionStatus) {
+    ///
+    /// Returns an action to emit the status update if the transition was valid.
+    pub fn update_status(&mut self, tx_hash: &Hash, new_status: TransactionStatus) -> Vec<Action> {
         if let Some(entry) = self.pool.get_mut(tx_hash) {
             // Case 1: Idempotent update - already in the target state
             if entry.status == new_status {
@@ -412,7 +454,7 @@ impl MempoolState {
                     status = %entry.status,
                     "Ignoring duplicate status update"
                 );
-                return;
+                return vec![];
             }
 
             // Case 2: Valid transition - apply it
@@ -423,8 +465,11 @@ impl MempoolState {
                     to = %new_status,
                     "Transaction status transition"
                 );
-                entry.status = new_status;
-                return;
+                entry.status = new_status.clone();
+                return vec![Action::EmitTransactionStatus {
+                    tx_hash: *tx_hash,
+                    status: new_status,
+                }];
             }
 
             // Case 3: Invalid transition - determine if stale or truly invalid
@@ -447,6 +492,7 @@ impl MempoolState {
                 );
             }
         }
+        vec![]
     }
 
     /// Get all NodeIds that are currently locked by in-flight transactions.
@@ -680,8 +726,7 @@ impl SubStateMachine for MempoolState {
             }
             // Handle status update events from execution
             Event::TransactionStatusChanged { tx_hash, status } => {
-                self.update_status(tx_hash, status.clone());
-                Some(vec![])
+                Some(self.update_status(tx_hash, status.clone()))
             }
             _ => None,
         }

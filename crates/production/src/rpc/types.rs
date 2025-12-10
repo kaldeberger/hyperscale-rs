@@ -102,13 +102,23 @@ pub struct TransactionStatusResponse {
     /// Transaction hash (hex-encoded).
     pub hash: String,
     /// Current status of the transaction.
+    /// Possible values: "pending", "committed", "executed", "completed", "blocked", "retried", "unknown", "error"
     pub status: String,
     /// Block height where committed (if committed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed_height: Option<u64>,
-    /// Final decision (if executed).
+    /// Final decision (if executed): "accept" or "reject".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
+    /// Hash of the transaction blocking this one (if blocked).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
+    /// Hash of the retry transaction (if retried).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_tx: Option<String>,
+    /// Error message if status lookup failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -118,12 +128,14 @@ pub struct TransactionStatusResponse {
 /// Response for `GET /api/v1/mempool`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MempoolStatusResponse {
-    /// Number of pending transactions.
+    /// Number of pending transactions (waiting to be included in a block).
     pub pending_count: usize,
-    /// Number of transactions being executed.
+    /// Number of transactions being executed (holding state locks).
     pub executing_count: usize,
     /// Total transactions in mempool.
     pub total_count: usize,
+    /// Number of transactions blocked waiting for a winner to complete.
+    pub blocked_count: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

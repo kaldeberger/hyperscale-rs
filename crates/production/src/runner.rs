@@ -3,7 +3,7 @@
 use crate::network::{
     compute_peer_id_for_validator, InboundSyncRequest, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
-use crate::rpc::NodeStatusState;
+use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
 use crate::storage::RocksDbStorage;
 use crate::sync::{SyncConfig, SyncManager};
 use crate::thread_pools::ThreadPoolManager;
@@ -153,6 +153,10 @@ pub struct ProductionRunnerBuilder {
     channel_capacity: usize,
     /// Optional RPC status state to update on block commits and view changes.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
+    /// Optional transaction status cache for RPC queries.
+    tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
+    /// Optional mempool snapshot for RPC queries.
+    mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -174,6 +178,8 @@ impl ProductionRunnerBuilder {
             ed25519_keypair: None,
             channel_capacity: 10_000,
             rpc_status: None,
+            tx_status_cache: None,
+            mempool_snapshot: None,
         }
     }
 
@@ -226,6 +232,23 @@ impl ProductionRunnerBuilder {
     /// fields as consensus progresses.
     pub fn rpc_status(mut self, status: Arc<TokioRwLock<NodeStatusState>>) -> Self {
         self.rpc_status = Some(status);
+        self
+    }
+
+    /// Set the transaction status cache for RPC queries.
+    ///
+    /// When set, the runner will update transaction statuses as they progress
+    /// through the mempool and execution pipeline.
+    pub fn tx_status_cache(mut self, cache: Arc<TokioRwLock<TransactionStatusCache>>) -> Self {
+        self.tx_status_cache = Some(cache);
+        self
+    }
+
+    /// Set the mempool snapshot for RPC queries.
+    ///
+    /// When set, the runner will periodically update mempool statistics.
+    pub fn mempool_snapshot(mut self, snapshot: Arc<TokioRwLock<MempoolSnapshot>>) -> Self {
+        self.mempool_snapshot = Some(snapshot);
         self
     }
 
@@ -328,6 +351,8 @@ impl ProductionRunnerBuilder {
             storage,
             executor,
             rpc_status: self.rpc_status,
+            tx_status_cache: self.tx_status_cache,
+            mempool_snapshot: self.mempool_snapshot,
             sync_request_rx,
             shutdown_rx,
             shutdown_tx: Some(shutdown_tx),
@@ -380,6 +405,10 @@ pub struct ProductionRunner {
     executor: Arc<RadixExecutor>,
     /// Optional RPC status state to update on block commits.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
+    /// Optional transaction status cache for RPC queries.
+    tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
+    /// Optional mempool snapshot for RPC queries.
+    mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
     /// Inbound sync request channel (from network adapter).
     sync_request_rx: mpsc::Receiver<InboundSyncRequest>,
     /// Shutdown signal receiver.
@@ -753,6 +782,20 @@ impl ProductionRunner {
                     if let Some(ref rpc_status) = self.rpc_status {
                         let mut status = rpc_status.write().await;
                         status.connected_peers = peer_count;
+                    }
+
+                    // Update mempool snapshot for RPC queries
+                    if let Some(ref snapshot) = self.mempool_snapshot {
+                        let stats = self.state.mempool().lock_contention_stats();
+                        let total = self.state.mempool().len();
+                        let mut snap = snapshot.write().await;
+                        snap.pending_count = stats.pending_count as usize;
+                        snap.blocked_count = stats.blocked_count as usize;
+                        // executing = total - pending - blocked (approximately)
+                        snap.executing_count = total.saturating_sub(stats.pending_count as usize)
+                            .saturating_sub(stats.blocked_count as usize);
+                        snap.total_count = total;
+                        snap.updated_at = Some(std::time::Instant::now());
                     }
                 }
             }
@@ -1191,13 +1234,20 @@ impl ProductionRunner {
                 tracing::debug!(?request_id, ?result, "Transaction result");
             }
 
-            Action::EmitTransactionStatus {
-                request_id,
-                tx_hash,
-                status,
-            } => {
-                tracing::debug!(?request_id, ?tx_hash, ?status, "Transaction status");
-                // TODO: Route to status subscribers
+            Action::EmitTransactionStatus { tx_hash, status } => {
+                tracing::debug!(?tx_hash, ?status, "Transaction status update");
+
+                // Update transaction status cache for RPC queries
+                if let Some(ref cache) = self.tx_status_cache {
+                    let cache = cache.clone();
+                    let status_clone = status.clone();
+                    // Use spawn to avoid blocking - cache update is fast but we don't want
+                    // to await on the write lock in the hot path
+                    tokio::spawn(async move {
+                        let mut cache = cache.write().await;
+                        cache.update(tx_hash, status_clone);
+                    });
+                }
             }
 
             Action::EmitCommittedBlock { block } => {

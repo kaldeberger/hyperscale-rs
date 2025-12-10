@@ -45,6 +45,6 @@ mod routes;
 mod server;
 mod types;
 
-pub use handlers::NodeStatusState;
+pub use handlers::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
 pub use server::{RpcServer, RpcServerConfig, RpcServerHandle};
 pub use types::*;

@@ -221,10 +221,7 @@ impl ParallelOrchestrator {
 
         info!(
             target_tps = self.config.target_tps,
-            submission_duration_ms,
-            total_transactions,
-            txs_per_ms,
-            "Starting simulation"
+            submission_duration_ms, total_transactions, txs_per_ms, "Starting simulation"
         );
 
         let start_time = Instant::now();
@@ -286,18 +283,30 @@ impl ParallelOrchestrator {
             // Log progress when completions cross thresholds
             if completed / progress_interval > last_logged_completed / progress_interval {
                 let elapsed = start_time.elapsed();
-                let current_tps = if elapsed.as_secs_f64() > 0.0 {
+                let sim_time = self.simulator.simulated_time();
+
+                // Wall-clock TPS: how fast our simulator is processing
+                let wall_tps = if elapsed.as_secs_f64() > 0.0 {
                     completed as f64 / elapsed.as_secs_f64()
                 } else {
                     0.0
                 };
+
+                // Simulated-time TPS: how fast the protocol processes transactions
+                let sim_tps = if sim_time.as_secs_f64() > 0.0 {
+                    completed as f64 / sim_time.as_secs_f64()
+                } else {
+                    0.0
+                };
+
                 info!(
                     submitted,
                     completed,
                     rejected,
                     in_flight = current_in_flight,
-                    simulated_time_ms = self.simulator.simulated_time().as_millis(),
-                    tps = format!("{:.1}", current_tps),
+                    simulated_time_ms = sim_time.as_millis(),
+                    sim_tps = format!("{:.0}", sim_tps),
+                    wall_tps = format!("{:.0}", wall_tps),
                     "Simulation progress"
                 );
                 last_logged_completed = completed;
@@ -305,12 +314,22 @@ impl ParallelOrchestrator {
         }
 
         let wall_clock_duration = start_time.elapsed();
+        let sim_time = self.simulator.simulated_time();
         let report = self.simulator.finalize(wall_clock_duration);
+
+        // Calculate simulated-time TPS (protocol throughput)
+        let sim_tps = if sim_time.as_secs_f64() > 0.0 {
+            report.completed as f64 / sim_time.as_secs_f64()
+        } else {
+            0.0
+        };
 
         info!(
             completed = report.completed,
             rejected = report.rejected,
-            tps = format!("{:.2}", report.tps),
+            sim_tps = format!("{:.0}", sim_tps),
+            wall_tps = format!("{:.0}", report.tps),
+            simulated_time_ms = sim_time.as_millis(),
             wall_clock_ms = wall_clock_duration.as_millis(),
             "Simulation complete"
         );

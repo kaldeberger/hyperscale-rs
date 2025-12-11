@@ -42,6 +42,8 @@ pub struct SharedMetrics {
     pub completed: AtomicU64,
     /// Total transactions rejected/aborted.
     pub rejected: AtomicU64,
+    /// Total retries (transactions that entered Retried state).
+    pub retries: AtomicU64,
 }
 
 impl SharedMetrics {
@@ -61,11 +63,16 @@ impl SharedMetrics {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_retry(&self) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             submitted: self.submitted.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
+            retries: self.retries.load(Ordering::Relaxed),
         }
     }
 }
@@ -76,6 +83,7 @@ pub struct MetricsSnapshot {
     pub submitted: u64,
     pub completed: u64,
     pub rejected: u64,
+    pub retries: u64,
 }
 
 /// Collects metrics and computes final report.
@@ -134,6 +142,7 @@ impl MetricsCollector {
                             TransactionStatus::Retried { new_tx } => {
                                 // Track the new hash instead, preserving original submit time
                                 self.in_flight.insert(new_tx, submit_time);
+                                self.shared.record_retry();
                             }
                             _ => {} // Non-final status (shouldn't happen)
                         }
@@ -173,6 +182,7 @@ impl MetricsCollector {
             submitted: snapshot.submitted,
             completed: snapshot.completed,
             rejected: snapshot.rejected,
+            retries: snapshot.retries,
             in_flight: self.in_flight.len() as u64,
             messages_dropped_buffer: router_stats.dropped_buffer,
             messages_dropped_loss: router_stats.dropped_loss,
@@ -202,6 +212,7 @@ pub struct SimulationReport {
     pub submitted: u64,
     pub completed: u64,
     pub rejected: u64,
+    pub retries: u64,
     pub in_flight: u64,
     pub messages_dropped_buffer: u64,
     pub messages_dropped_loss: u64,
@@ -224,6 +235,7 @@ impl SimulationReport {
         println!("  Submitted:  {}", self.submitted);
         println!("  Completed:  {}", self.completed);
         println!("  Rejected:   {}", self.rejected);
+        println!("  Retries:    {}", self.retries);
         println!("  In-flight:  {} (at cutoff)", self.in_flight);
         println!();
         println!("Throughput:");

@@ -17,6 +17,9 @@ pub struct MetricsCollector {
     /// Rejection count.
     rejections: u64,
 
+    /// Retry count (transactions that entered Retried state).
+    retries: u64,
+
     /// Latency histogram (microseconds).
     latency_histogram: Histogram<u64>,
 
@@ -59,6 +62,7 @@ impl MetricsCollector {
             submissions: 0,
             completions: 0,
             rejections: 0,
+            retries: 0,
             latency_histogram: Histogram::new(3).expect("histogram creation should succeed"),
             start_time,
             submission_end_time: None,
@@ -94,6 +98,11 @@ impl MetricsCollector {
     /// Record a transaction rejection.
     pub fn record_rejection(&mut self) {
         self.rejections += 1;
+    }
+
+    /// Record a transaction retry.
+    pub fn record_retry(&mut self) {
+        self.retries += 1;
     }
 
     /// Set the submission end time for accurate TPS calculation.
@@ -184,6 +193,7 @@ impl MetricsCollector {
             total_submitted: self.submissions,
             total_completed: self.completions,
             total_rejected: self.rejections,
+            total_retries: self.retries,
             in_flight_at_end: self.in_flight_at_end,
             average_tps,
             peak_tps: self.peak_tps,
@@ -229,6 +239,8 @@ pub struct SimulationReport {
     pub total_completed: u64,
     /// Total transactions rejected.
     pub total_rejected: u64,
+    /// Total retries (transactions that entered Retried state).
+    pub total_retries: u64,
     /// Transactions still in-flight at simulation end.
     pub in_flight_at_end: u64,
     /// Average TPS over the submission period.
@@ -303,6 +315,7 @@ impl SimulationReport {
         println!("  Submitted:  {}", self.total_submitted);
         println!("  Completed:  {}", self.total_completed);
         println!("  Rejected:   {}", self.total_rejected);
+        println!("  Retries:    {}", self.total_retries);
         println!("  In-flight:  {} (at cutoff)", self.in_flight_at_end);
         println!();
         println!("Throughput:");

@@ -263,6 +263,7 @@ impl Simulator {
                                 TransactionStatus::Retried { new_tx } => {
                                     // Transaction was retried - track the new hash instead
                                     self.in_flight.insert(new_tx, (submit_time, shard));
+                                    self.metrics.record_retry();
                                     debug!(?hash, ?new_tx, "Transaction retried");
                                 }
                                 _ => unreachable!("Transaction status is not final: {:?}", status),

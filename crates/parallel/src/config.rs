@@ -6,11 +6,11 @@ use std::time::Duration;
 
 /// Configuration for parallel simulation.
 ///
-/// The parallel simulator runs each node as an independent tokio task,
+/// The parallel simulator processes nodes using rayon for CPU parallelism,
 /// enabling multi-core utilization for performance testing.
 ///
 /// Uses simulated time (not wall-clock time) so that:
-/// - Timers fire instantly (no real delays)
+/// - Timers fire based on simulated time (no wall-clock delays)
 /// - Crypto verification is done synchronously inline
 /// - Simulation runs as fast as the CPU can process
 #[derive(Debug, Clone)]

@@ -68,8 +68,8 @@ enum Commands {
         #[arg(long, default_value = "100")]
         accounts_per_shard: usize,
 
-        /// Account selection mode (random, round-robin, zipf)
-        #[arg(long, default_value = "random")]
+        /// Account selection mode (random, round-robin, no-contention, zipf, zipf:N)
+        #[arg(long, default_value = "no-contention")]
         selection: String,
 
         /// Wait for nodes to be ready before starting
@@ -138,6 +138,7 @@ fn parse_selection_mode(s: &str) -> Result<SelectionMode, String> {
     match s.to_lowercase().as_str() {
         "random" => Ok(SelectionMode::Random),
         "round-robin" | "roundrobin" => Ok(SelectionMode::RoundRobin),
+        "no-contention" | "nocontention" => Ok(SelectionMode::NoContention),
         "zipf" => Ok(SelectionMode::Zipf { exponent: 1.5 }),
         s if s.starts_with("zipf:") => {
             let exp: f64 = s[5..]

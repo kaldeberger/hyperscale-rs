@@ -150,11 +150,11 @@ impl LatencyTracker {
     ///
     /// Any transactions still in-flight are counted as timed out.
     pub async fn finalize(mut self) -> LatencyReport {
+        // Wait for any in-flight transactions to complete
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
         // Stop the polling task
         self.stop_polling();
-
-        // Wait a short time for any final polls
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Mark remaining in-flight as timed out
         let timed_out = {

@@ -230,6 +230,7 @@ impl SimNode {
                 TimerId::Proposal => Event::ProposalTimer,
                 TimerId::ViewChange => Event::ViewChangeTimer,
                 TimerId::Cleanup => Event::CleanupTimer,
+                TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
             };
             self.internal_queue.push_back(event);
         }
@@ -514,6 +515,20 @@ impl SimNode {
                     height = block.header.height.0,
                     "Block committed"
                 );
+            }
+
+            // Global Consensus Actions (TODO: implement when GlobalConsensusState exists)
+            Action::ProposeGlobalBlock { .. }
+            | Action::BroadcastGlobalBlockVote { .. }
+            | Action::TransitionEpoch { .. }
+            | Action::MarkValidatorReady { .. }
+            | Action::InitiateShardSplit { .. }
+            | Action::CompleteShardSplit { .. }
+            | Action::InitiateShardMerge { .. }
+            | Action::CompleteShardMerge { .. }
+            | Action::PersistEpochConfig { .. }
+            | Action::FetchEpochConfig { .. } => {
+                // Not yet implemented - will be handled by GlobalConsensusState
             }
         }
     }

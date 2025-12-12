@@ -2,9 +2,10 @@
 
 use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, Hash, NodeId, PublicKey, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate,
-    ViewChangeCertificate, ViewChangeVote,
+    Block, BlockHeight, BlockVote, EpochConfig, EpochId, Hash, NodeId, PublicKey,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
+    StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate,
+    ViewChangeCertificate, ViewChangeVote, VotePower,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -269,6 +270,112 @@ pub enum Action {
     PersistTransactionCertificate { certificate: TransactionCertificate },
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Global Consensus / Epoch Management
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Propose a global block for epoch management.
+    ///
+    /// Only the designated global proposer (rotating based on epoch height) calls this.
+    ProposeGlobalBlock {
+        /// Current epoch.
+        epoch: EpochId,
+        /// Height within the global chain.
+        height: BlockHeight,
+        /// The proposed next epoch configuration (if this finalizes an epoch).
+        next_epoch_config: Option<Box<EpochConfig>>,
+    },
+
+    /// Broadcast a shard vote for a global block.
+    ///
+    /// This is the "shard-level vote" - sent after 2f+1 local validators agree.
+    BroadcastGlobalBlockVote {
+        /// The block being voted on.
+        block_hash: Hash,
+        /// This shard's ID.
+        shard: ShardGroupId,
+        /// Aggregated BLS signature from 2f+1 local validators.
+        shard_signature: Signature,
+        /// Which validators in this shard signed.
+        signers: SignerBitfield,
+        /// Total voting power in the shard signature.
+        voting_power: VotePower,
+    },
+
+    /// Initiate epoch transition.
+    ///
+    /// Called when EpochTransitionReady event is received.
+    /// Updates the DynamicTopology and notifies subsystems.
+    TransitionEpoch {
+        /// The epoch we're transitioning from.
+        from_epoch: EpochId,
+        /// The epoch we're transitioning to.
+        to_epoch: EpochId,
+        /// The finalized configuration for the new epoch.
+        next_config: Box<EpochConfig>,
+    },
+
+    /// Mark this validator as ready for the new epoch.
+    ///
+    /// Called after sync completes when validator was in Waiting state.
+    MarkValidatorReady {
+        /// The epoch.
+        epoch: EpochId,
+        /// The shard.
+        shard: ShardGroupId,
+    },
+
+    /// Initiate a shard split.
+    ///
+    /// Marks the shard as splitting in the topology, triggering transaction rejection.
+    InitiateShardSplit {
+        /// The shard being split.
+        source_shard: ShardGroupId,
+        /// The new shard ID.
+        new_shard: ShardGroupId,
+        /// The hash range split point.
+        split_point: u64,
+    },
+
+    /// Complete a shard split.
+    ///
+    /// Called after state migration is complete.
+    CompleteShardSplit {
+        /// The original shard.
+        source_shard: ShardGroupId,
+        /// The new shard.
+        new_shard: ShardGroupId,
+    },
+
+    /// Initiate a shard merge.
+    InitiateShardMerge {
+        /// First shard.
+        shard_a: ShardGroupId,
+        /// Second shard.
+        shard_b: ShardGroupId,
+        /// Resulting shard ID.
+        merged_shard: ShardGroupId,
+    },
+
+    /// Complete a shard merge.
+    CompleteShardMerge {
+        /// The merged shard.
+        merged_shard: ShardGroupId,
+    },
+
+    /// Persist epoch configuration to storage.
+    PersistEpochConfig {
+        /// The epoch configuration to persist.
+        config: Box<EpochConfig>,
+    },
+
+    /// Fetch the latest epoch configuration from storage.
+    ///
+    /// Returns via Event (to be added) when complete.
+    FetchEpochConfig {
+        /// Optional epoch ID to fetch (None = latest).
+        epoch: Option<EpochId>,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Storage: Read Requests (returns callback Event)
     // ═══════════════════════════════════════════════════════════════════════
     /// Fetch state entries for nodes (for cross-shard provisioning).
@@ -397,6 +504,18 @@ impl Action {
             Action::FetchStateEntries { .. } => "FetchStateEntries",
             Action::FetchBlock { .. } => "FetchBlock",
             Action::FetchChainMetadata => "FetchChainMetadata",
+
+            // Global Consensus / Epoch Management
+            Action::ProposeGlobalBlock { .. } => "ProposeGlobalBlock",
+            Action::BroadcastGlobalBlockVote { .. } => "BroadcastGlobalBlockVote",
+            Action::TransitionEpoch { .. } => "TransitionEpoch",
+            Action::MarkValidatorReady { .. } => "MarkValidatorReady",
+            Action::InitiateShardSplit { .. } => "InitiateShardSplit",
+            Action::CompleteShardSplit { .. } => "CompleteShardSplit",
+            Action::InitiateShardMerge { .. } => "InitiateShardMerge",
+            Action::CompleteShardMerge { .. } => "CompleteShardMerge",
+            Action::PersistEpochConfig { .. } => "PersistEpochConfig",
+            Action::FetchEpochConfig { .. } => "FetchEpochConfig",
         }
     }
 }

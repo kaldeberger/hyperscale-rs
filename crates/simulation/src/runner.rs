@@ -1042,6 +1042,79 @@ impl SimulationRunner {
                     },
                 );
             }
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // Global Consensus Actions (TODO: implement when GlobalConsensusState exists)
+            // ═══════════════════════════════════════════════════════════════════════
+            Action::ProposeGlobalBlock { epoch, height, .. } => {
+                tracing::trace!(?epoch, ?height, "ProposeGlobalBlock - not yet implemented");
+            }
+            Action::BroadcastGlobalBlockVote {
+                block_hash, shard, ..
+            } => {
+                tracing::trace!(
+                    ?block_hash,
+                    ?shard,
+                    "BroadcastGlobalBlockVote - not yet implemented"
+                );
+            }
+            Action::TransitionEpoch {
+                from_epoch,
+                to_epoch,
+                ..
+            } => {
+                tracing::debug!(
+                    ?from_epoch,
+                    ?to_epoch,
+                    "TransitionEpoch - not yet implemented"
+                );
+            }
+            Action::MarkValidatorReady { epoch, shard } => {
+                tracing::debug!(?epoch, ?shard, "MarkValidatorReady - not yet implemented");
+            }
+            Action::InitiateShardSplit {
+                source_shard,
+                new_shard,
+                split_point,
+            } => {
+                tracing::info!(
+                    ?source_shard,
+                    ?new_shard,
+                    split_point,
+                    "InitiateShardSplit - not yet implemented"
+                );
+            }
+            Action::CompleteShardSplit {
+                source_shard,
+                new_shard,
+            } => {
+                tracing::info!(
+                    ?source_shard,
+                    ?new_shard,
+                    "CompleteShardSplit - not yet implemented"
+                );
+            }
+            Action::InitiateShardMerge {
+                shard_a,
+                shard_b,
+                merged_shard,
+            } => {
+                tracing::info!(
+                    ?shard_a,
+                    ?shard_b,
+                    ?merged_shard,
+                    "InitiateShardMerge - not yet implemented"
+                );
+            }
+            Action::CompleteShardMerge { merged_shard } => {
+                tracing::info!(?merged_shard, "CompleteShardMerge - not yet implemented");
+            }
+            Action::PersistEpochConfig { .. } => {
+                tracing::debug!("PersistEpochConfig - not yet implemented");
+            }
+            Action::FetchEpochConfig { epoch } => {
+                tracing::debug!(?epoch, "FetchEpochConfig - not yet implemented");
+            }
         }
     }
 
@@ -1145,6 +1218,7 @@ impl SimulationRunner {
             TimerId::Proposal => Event::ProposalTimer,
             TimerId::ViewChange => Event::ViewChangeTimer,
             TimerId::Cleanup => Event::CleanupTimer,
+            TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
         }
     }
 

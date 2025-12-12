@@ -1,9 +1,10 @@
 //! Event types for the deterministic state machine.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockVote, ExecutionResult, Hash, QuorumCertificate,
-    RoutableTransaction, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
-    TransactionAbort, TransactionDefer, ViewChangeCertificate, ViewChangeVote,
+    Block, BlockHeader, BlockHeight, BlockVote, EpochConfig, EpochId, ExecutionResult, Hash,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StateCertificate, StateEntry,
+    StateProvision, StateVoteBlock, TransactionAbort, TransactionDefer, ValidatorId,
+    ViewChangeCertificate, ViewChangeVote,
 };
 use std::sync::Arc;
 
@@ -307,6 +308,141 @@ pub enum Event {
     SubmitTransaction { tx: Arc<RoutableTransaction> },
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Global Consensus / Epoch Events (priority varies by type)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Timer for global consensus operations (priority: Timer).
+    GlobalConsensusTimer,
+
+    /// Received a global block proposal from another validator (priority: Network).
+    ///
+    /// Global blocks contain epoch transition decisions: shuffles, splits, merges.
+    GlobalBlockReceived {
+        /// Epoch this block belongs to.
+        epoch: EpochId,
+        /// Block height within the global chain.
+        height: BlockHeight,
+        /// Proposer of this global block.
+        proposer: ValidatorId,
+        /// Hash of the proposed block.
+        block_hash: Hash,
+        /// The next epoch configuration (if this block finalizes an epoch transition).
+        next_epoch_config: Option<Box<EpochConfig>>,
+    },
+
+    /// Received a vote on a global block (priority: Network).
+    ///
+    /// This is a "shard vote" - represents 2f+1 agreement within a shard.
+    GlobalBlockVoteReceived {
+        /// The block being voted on.
+        block_hash: Hash,
+        /// The shard casting this vote.
+        shard: ShardGroupId,
+        /// Aggregated signature from 2f+1 validators in the shard.
+        shard_signature: hyperscale_types::Signature,
+        /// Which validators in the shard signed.
+        signers: hyperscale_types::SignerBitfield,
+        /// Total voting power represented.
+        voting_power: hyperscale_types::VotePower,
+    },
+
+    /// Global quorum certificate formed (priority: Internal).
+    ///
+    /// 2/3 of shards have voted, epoch transition can proceed.
+    GlobalQcFormed {
+        /// The block that achieved global quorum.
+        block_hash: Hash,
+        /// The epoch being finalized.
+        epoch: EpochId,
+    },
+
+    /// Epoch transition is imminent (priority: Internal).
+    ///
+    /// Emitted when the local shard reaches epoch_end_height.
+    /// Triggers: stop accepting new transactions, drain in-flight ones.
+    EpochEndApproaching {
+        /// Current epoch that is ending.
+        current_epoch: EpochId,
+        /// Height at which epoch ends.
+        end_height: BlockHeight,
+    },
+
+    /// Ready to transition to next epoch (priority: Internal).
+    ///
+    /// Emitted when:
+    /// 1. All in-flight transactions have completed/aborted
+    /// 2. Global consensus has finalized the next epoch config
+    /// 3. Validator has synced to new shard (if shuffled)
+    EpochTransitionReady {
+        /// The epoch we're transitioning from.
+        from_epoch: EpochId,
+        /// The epoch we're transitioning to.
+        to_epoch: EpochId,
+        /// The finalized configuration for the new epoch.
+        next_config: Box<EpochConfig>,
+    },
+
+    /// Epoch transition completed (priority: Internal).
+    ///
+    /// The DynamicTopology has been updated, new epoch is now active.
+    EpochTransitionComplete {
+        /// The new active epoch.
+        new_epoch: EpochId,
+        /// This validator's new shard (may have changed due to shuffle).
+        new_shard: ShardGroupId,
+        /// Whether this validator is in Waiting state (needs to sync).
+        is_waiting: bool,
+    },
+
+    /// Validator finished syncing to new shard after shuffle (priority: Internal).
+    ///
+    /// Transitions validator from Waiting to Active state.
+    ValidatorSyncComplete {
+        /// The epoch in which sync completed.
+        epoch: EpochId,
+        /// The shard that was synced to.
+        shard: ShardGroupId,
+    },
+
+    /// Shard split initiated (priority: Internal).
+    ///
+    /// Emitted when global consensus decides to split a shard.
+    /// Triggers: reject new transactions for affected NodeIds, drain in-flight.
+    ShardSplitInitiated {
+        /// The shard being split.
+        source_shard: ShardGroupId,
+        /// The new shard that will receive half the state.
+        new_shard: ShardGroupId,
+        /// The hash range boundary for the split.
+        split_point: u64,
+    },
+
+    /// Shard split completed (priority: Internal).
+    ///
+    /// State has been migrated, both shards are now operational.
+    ShardSplitComplete {
+        /// The original shard (now smaller hash range).
+        source_shard: ShardGroupId,
+        /// The new shard (other half of hash range).
+        new_shard: ShardGroupId,
+    },
+
+    /// Shard merge initiated (priority: Internal).
+    ShardMergeInitiated {
+        /// First shard being merged.
+        shard_a: ShardGroupId,
+        /// Second shard being merged.
+        shard_b: ShardGroupId,
+        /// The resulting merged shard ID.
+        merged_shard: ShardGroupId,
+    },
+
+    /// Shard merge completed (priority: Internal).
+    ShardMergeComplete {
+        /// The resulting merged shard.
+        merged_shard: ShardGroupId,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Sync Protocol Events (priority varies by type)
     // ═══════════════════════════════════════════════════════════════════════
     /// Detected that we're behind and need to sync (priority: Internal).
@@ -375,9 +511,10 @@ impl Event {
             | Event::ChainMetadataFetched { .. } => EventPriority::Internal,
 
             // Timer events
-            Event::ProposalTimer | Event::ViewChangeTimer | Event::CleanupTimer => {
-                EventPriority::Timer
-            }
+            Event::ProposalTimer
+            | Event::ViewChangeTimer
+            | Event::CleanupTimer
+            | Event::GlobalConsensusTimer => EventPriority::Timer,
 
             // Network events
             Event::BlockHeaderReceived { .. }
@@ -387,10 +524,23 @@ impl Event {
             | Event::StateProvisionReceived { .. }
             | Event::StateVoteReceived { .. }
             | Event::StateCertificateReceived { .. }
-            | Event::TransactionGossipReceived { .. } => EventPriority::Network,
+            | Event::TransactionGossipReceived { .. }
+            | Event::GlobalBlockReceived { .. }
+            | Event::GlobalBlockVoteReceived { .. } => EventPriority::Network,
 
             // Client events (processed last at same time)
             Event::SubmitTransaction { .. } => EventPriority::Client,
+
+            // Global consensus internal events
+            Event::GlobalQcFormed { .. }
+            | Event::EpochEndApproaching { .. }
+            | Event::EpochTransitionReady { .. }
+            | Event::EpochTransitionComplete { .. }
+            | Event::ValidatorSyncComplete { .. }
+            | Event::ShardSplitInitiated { .. }
+            | Event::ShardSplitComplete { .. }
+            | Event::ShardMergeInitiated { .. }
+            | Event::ShardMergeComplete { .. } => EventPriority::Internal,
 
             // Sync events have varying priorities
             Event::SyncNeeded { .. }
@@ -471,6 +621,20 @@ impl Event {
 
             // Client Requests
             Event::SubmitTransaction { .. } => "SubmitTransaction",
+
+            // Global Consensus / Epoch
+            Event::GlobalConsensusTimer => "GlobalConsensusTimer",
+            Event::GlobalBlockReceived { .. } => "GlobalBlockReceived",
+            Event::GlobalBlockVoteReceived { .. } => "GlobalBlockVoteReceived",
+            Event::GlobalQcFormed { .. } => "GlobalQcFormed",
+            Event::EpochEndApproaching { .. } => "EpochEndApproaching",
+            Event::EpochTransitionReady { .. } => "EpochTransitionReady",
+            Event::EpochTransitionComplete { .. } => "EpochTransitionComplete",
+            Event::ValidatorSyncComplete { .. } => "ValidatorSyncComplete",
+            Event::ShardSplitInitiated { .. } => "ShardSplitInitiated",
+            Event::ShardSplitComplete { .. } => "ShardSplitComplete",
+            Event::ShardMergeInitiated { .. } => "ShardMergeInitiated",
+            Event::ShardMergeComplete { .. } => "ShardMergeComplete",
 
             // Sync Protocol
             Event::SyncNeeded { .. } => "SyncNeeded",

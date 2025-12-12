@@ -21,6 +21,7 @@ mod signing;
 
 // Consensus types
 mod block;
+mod epoch;
 mod quorum_certificate;
 mod signer_bitfield;
 mod state;
@@ -30,6 +31,10 @@ mod validator;
 mod view_change;
 
 pub use crypto::{AggregateError, KeyPair, KeyType, PublicKey, Signature};
+pub use epoch::{
+    EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig,
+    ShardHashRange, ValidatorRating, ValidatorShardState, DEFAULT_EPOCH_LENGTH,
+};
 pub use hash::{Hash, HexError};
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{GlobalMessage, NetworkMessage, Request, ShardMessage};
@@ -44,7 +49,9 @@ pub use signer_bitfield::SignerBitfield;
 pub use state::{
     ExecutionResult, StateCertificate, StateEntry, StateProvision, StateVoteBlock, SubstateWrite,
 };
-pub use topology::{shard_for_node, StaticTopology, Topology, TopologyError};
+pub use topology::{
+    shard_for_node, DynamicTopology, DynamicTopologyError, StaticTopology, Topology, TopologyError,
+};
 pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, RetryDetails,
     RoutableTransaction, ShardExecutionProof, TransactionAbort, TransactionCertificate,

@@ -13,6 +13,7 @@ use hyperscale_types::{
     BlockHeight, KeyPair, PublicKey, QuorumCertificate, ShardGroupId, Signature, SignerBitfield,
     Topology, ValidatorId, ViewChangeCertificate, VotePower,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,7 +135,7 @@ impl ViewChangeState {
     }
 
     /// Get the local committee.
-    fn committee(&self) -> &[ValidatorId] {
+    fn committee(&self) -> Cow<'_, [ValidatorId]> {
         self.topology.local_committee()
     }
 

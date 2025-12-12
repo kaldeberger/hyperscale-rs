@@ -13,6 +13,7 @@ use hyperscale_types::{
     RoutableTransaction, ShardGroupId, Topology, TransactionAbort, TransactionCertificate,
     TransactionDefer, ValidatorId, VotePower,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -266,7 +267,7 @@ impl BftState {
     }
 
     /// Get the local committee.
-    fn committee(&self) -> &[ValidatorId] {
+    fn committee(&self) -> Cow<'_, [ValidatorId]> {
         self.topology.local_committee()
     }
 

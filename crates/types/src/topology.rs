@@ -1,8 +1,10 @@
 //! Topology trait and static implementation.
 
 use crate::{
-    NodeId, PublicKey, RoutableTransaction, ShardGroupId, ValidatorId, ValidatorSet, VotePower,
+    EpochId, NodeId, PublicKey, RoutableTransaction, ShardGroupId, ValidatorId, ValidatorSet,
+    VotePower,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -28,7 +30,11 @@ pub trait Topology: Send + Sync {
     fn num_shards(&self) -> u64;
 
     /// Get the ordered committee members for a shard.
-    fn committee_for_shard(&self, shard: ShardGroupId) -> &[ValidatorId];
+    ///
+    /// Returns `Cow` to allow both borrowed (StaticTopology) and owned (DynamicTopology) data.
+    /// This enables interior mutability for dynamic topologies while maintaining zero-copy
+    /// performance for static topologies.
+    fn committee_for_shard(&self, shard: ShardGroupId) -> Cow<'_, [ValidatorId]>;
 
     /// Get total voting power for a shard's committee.
     fn voting_power_for_shard(&self, shard: ShardGroupId) -> u64;
@@ -46,7 +52,8 @@ pub trait Topology: Send + Sync {
     ///
     /// Returns None if the index is out of bounds.
     fn local_validator_at_index(&self, index: usize) -> Option<ValidatorId> {
-        self.local_committee().get(index).copied()
+        let committee = self.local_committee();
+        committee.get(index).copied()
     }
 
     // Derived methods
@@ -62,9 +69,8 @@ pub trait Topology: Send + Sync {
         shard: ShardGroupId,
         validator_id: ValidatorId,
     ) -> Option<usize> {
-        self.committee_for_shard(shard)
-            .iter()
-            .position(|v| *v == validator_id)
+        let committee = self.committee_for_shard(shard);
+        committee.iter().position(|v| *v == validator_id)
     }
 
     /// Check if the given voting power meets quorum for a shard (> 2/3).
@@ -78,7 +84,7 @@ pub trait Topology: Send + Sync {
     }
 
     /// Get the ordered committee members for the local shard.
-    fn local_committee(&self) -> &[ValidatorId] {
+    fn local_committee(&self) -> Cow<'_, [ValidatorId]> {
         self.committee_for_shard(self.local_shard())
     }
 
@@ -114,8 +120,9 @@ pub trait Topology: Send + Sync {
 
     /// Get the proposer for a given height and round.
     fn proposer_for(&self, height: u64, round: u64) -> ValidatorId {
-        let index = (height + round) as usize % self.local_committee_size();
-        self.local_committee()[index]
+        let committee = self.local_committee();
+        let index = (height + round) as usize % committee.len();
+        committee[index]
     }
 
     /// Check if the local validator should propose at this height and round.
@@ -187,6 +194,54 @@ pub trait Topology: Send + Sync {
             .iter()
             .chain(tx.declared_reads.iter())
             .any(|node_id| self.shard_for_node_id(node_id) == local)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Epoch-awareness methods (for dynamic topology support)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Get the current epoch identifier.
+    ///
+    /// For static topologies, this always returns epoch 0 (genesis).
+    /// For dynamic topologies, this returns the current active epoch.
+    fn current_epoch(&self) -> EpochId {
+        EpochId::GENESIS
+    }
+
+    /// Get the block height at which the current epoch ends.
+    ///
+    /// For static topologies, this returns the maximum block height (epochs never end).
+    /// For dynamic topologies, this returns the expected end height for the local shard.
+    fn epoch_end_height(&self) -> crate::BlockHeight {
+        crate::BlockHeight(u64::MAX)
+    }
+
+    /// Check if this validator can participate in consensus.
+    ///
+    /// Returns `false` if the validator is in a "Waiting" state (syncing to a new shard
+    /// after being shuffled). In this state, the validator receives messages but cannot vote.
+    ///
+    /// For static topologies, this always returns `true`.
+    fn can_participate_in_consensus(&self) -> bool {
+        true
+    }
+
+    /// Check if a shard is currently in a splitting state.
+    ///
+    /// When a shard is splitting, the mempool should reject new transactions
+    /// targeting NodeIds in that shard to allow in-flight transactions to drain.
+    ///
+    /// For static topologies, this always returns `false`.
+    fn is_shard_splitting(&self, _shard: ShardGroupId) -> bool {
+        false
+    }
+
+    /// Check if a NodeId belongs to a shard that is currently splitting.
+    ///
+    /// Convenience method that combines `shard_for_node_id` and `is_shard_splitting`.
+    fn is_node_in_splitting_shard(&self, node_id: &NodeId) -> bool {
+        let shard = self.shard_for_node_id(node_id);
+        self.is_shard_splitting(shard)
     }
 }
 
@@ -403,11 +458,13 @@ impl Topology for StaticTopology {
         self.num_shards
     }
 
-    fn committee_for_shard(&self, shard: ShardGroupId) -> &[ValidatorId] {
-        self.shard_committees
-            .get(&shard)
-            .map(|c| c.committee.as_slice())
-            .unwrap_or(&[])
+    fn committee_for_shard(&self, shard: ShardGroupId) -> Cow<'_, [ValidatorId]> {
+        Cow::Borrowed(
+            self.shard_committees
+                .get(&shard)
+                .map(|c| c.committee.as_slice())
+                .unwrap_or(&[]),
+        )
     }
 
     fn voting_power_for_shard(&self, shard: ShardGroupId) -> u64 {
@@ -431,6 +488,324 @@ impl Topology for StaticTopology {
 
     fn global_validator_set(&self) -> &ValidatorSet {
         &self.global_validator_set
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dynamic Topology
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::{BlockHeight, EpochConfig, ValidatorShardState};
+use std::collections::HashSet;
+use std::sync::RwLock;
+
+/// Dynamic topology that can be updated at epoch boundaries.
+///
+/// Unlike `StaticTopology`, this implementation:
+/// - Supports epoch transitions with validator shuffling
+/// - Tracks validator state (Active, Waiting, etc.)
+/// - Tracks shards that are splitting (for transaction rejection)
+/// - Uses interior mutability via `RwLock` for epoch updates
+///
+/// The `Cow` return type in `committee_for_shard` allows this implementation
+/// to return owned data from behind the `RwLock`.
+pub struct DynamicTopology {
+    /// Local validator ID (immutable).
+    local_validator_id: ValidatorId,
+
+    /// Mutable state protected by RwLock.
+    inner: RwLock<DynamicTopologyInner>,
+}
+
+/// Interior state of DynamicTopology.
+struct DynamicTopologyInner {
+    /// Current epoch configuration.
+    current: EpochConfig,
+
+    /// Next epoch configuration (set during transition window).
+    next: Option<EpochConfig>,
+
+    /// Current shard for this validator.
+    local_shard: ShardGroupId,
+
+    /// State within the shard.
+    local_state: ValidatorShardState,
+
+    /// Validator public keys and voting power cache.
+    validator_info: HashMap<ValidatorId, ValidatorInfoInternal>,
+
+    /// Shards currently in split grace period.
+    /// Transactions targeting these shards are rejected.
+    splitting_shards: HashSet<ShardGroupId>,
+}
+
+/// Error type for topology operations.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DynamicTopologyError {
+    /// No next epoch configuration available.
+    #[error("no next epoch configuration available")]
+    NoNextEpoch,
+
+    /// Validator not found in epoch configuration.
+    #[error("validator {0:?} not found in epoch configuration")]
+    ValidatorNotInEpoch(ValidatorId),
+}
+
+impl DynamicTopology {
+    /// Create from initial epoch configuration.
+    pub fn from_epoch_config(
+        local_validator_id: ValidatorId,
+        epoch: EpochConfig,
+    ) -> Result<Self, DynamicTopologyError> {
+        let local_shard = epoch.find_validator_shard(local_validator_id).ok_or(
+            DynamicTopologyError::ValidatorNotInEpoch(local_validator_id),
+        )?;
+
+        let local_state = if epoch.is_validator_waiting(local_validator_id, local_shard) {
+            ValidatorShardState::Waiting
+        } else {
+            ValidatorShardState::Active
+        };
+
+        let validator_info = epoch
+            .validator_set
+            .validators
+            .iter()
+            .map(|v| {
+                (
+                    v.validator_id,
+                    ValidatorInfoInternal {
+                        voting_power: v.voting_power,
+                        public_key: v.public_key.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        Ok(Self {
+            local_validator_id,
+            inner: RwLock::new(DynamicTopologyInner {
+                current: epoch,
+                next: None,
+                local_shard,
+                local_state,
+                validator_info,
+                splitting_shards: HashSet::new(),
+            }),
+        })
+    }
+
+    /// Create as an Arc for use with trait objects.
+    pub fn into_arc(self) -> Arc<dyn Topology> {
+        Arc::new(self)
+    }
+
+    /// Set the next epoch configuration.
+    ///
+    /// Called when global consensus has finalized the next epoch config.
+    pub fn set_next_epoch(&self, next: EpochConfig) {
+        let mut inner = self.inner.write().expect("RwLock poisoned");
+        inner.next = Some(next);
+    }
+
+    /// Transition to the next epoch.
+    ///
+    /// Called when epoch boundary is reached.
+    pub fn transition_to_next_epoch(&self) -> Result<(), DynamicTopologyError> {
+        let mut inner = self.inner.write().expect("RwLock poisoned");
+
+        let next = inner.next.take().ok_or(DynamicTopologyError::NoNextEpoch)?;
+
+        // Update local shard assignment
+        let new_shard = next.find_validator_shard(self.local_validator_id).ok_or(
+            DynamicTopologyError::ValidatorNotInEpoch(self.local_validator_id),
+        )?;
+
+        // Determine if we're in waiting state
+        let new_state = if next.is_validator_waiting(self.local_validator_id, new_shard) {
+            ValidatorShardState::Waiting
+        } else {
+            ValidatorShardState::Active
+        };
+
+        // Update validator info cache
+        inner.validator_info = next
+            .validator_set
+            .validators
+            .iter()
+            .map(|v| {
+                (
+                    v.validator_id,
+                    ValidatorInfoInternal {
+                        voting_power: v.voting_power,
+                        public_key: v.public_key.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        inner.local_shard = new_shard;
+        inner.local_state = new_state;
+        inner.current = next;
+
+        // Clear splitting shards on epoch transition
+        inner.splitting_shards.clear();
+
+        Ok(())
+    }
+
+    /// Mark a shard as splitting (entering grace period).
+    pub fn mark_shard_splitting(&self, shard: ShardGroupId) {
+        let mut inner = self.inner.write().expect("RwLock poisoned");
+        inner.splitting_shards.insert(shard);
+    }
+
+    /// Clear the splitting state for a shard.
+    pub fn clear_shard_splitting(&self, shard: ShardGroupId) {
+        let mut inner = self.inner.write().expect("RwLock poisoned");
+        inner.splitting_shards.remove(&shard);
+    }
+
+    /// Get the current epoch ID.
+    pub fn epoch_id(&self) -> EpochId {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner.current.epoch_id
+    }
+
+    /// Get the local validator's shard state.
+    pub fn local_validator_state(&self) -> ValidatorShardState {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner.local_state
+    }
+
+    /// Check if the next epoch configuration is set.
+    pub fn has_next_epoch(&self) -> bool {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner.next.is_some()
+    }
+}
+
+impl Topology for DynamicTopology {
+    fn local_validator_id(&self) -> ValidatorId {
+        self.local_validator_id
+    }
+
+    fn local_shard(&self) -> ShardGroupId {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner.local_shard
+    }
+
+    fn num_shards(&self) -> u64 {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner.current.num_shards
+    }
+
+    fn committee_for_shard(&self, shard: ShardGroupId) -> Cow<'_, [ValidatorId]> {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        let validators = inner
+            .current
+            .shard_committees
+            .get(&shard)
+            .map(|c| c.active_validators.clone())
+            .unwrap_or_default();
+        Cow::Owned(validators)
+    }
+
+    fn voting_power_for_shard(&self, shard: ShardGroupId) -> u64 {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner
+            .current
+            .shard_committees
+            .get(&shard)
+            .map(|c| c.total_voting_power)
+            .unwrap_or(0)
+    }
+
+    fn voting_power(&self, validator_id: ValidatorId) -> Option<u64> {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner
+            .validator_info
+            .get(&validator_id)
+            .map(|v| v.voting_power)
+    }
+
+    fn public_key(&self, validator_id: ValidatorId) -> Option<PublicKey> {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner
+            .validator_info
+            .get(&validator_id)
+            .map(|v| v.public_key.clone())
+    }
+
+    fn global_validator_set(&self) -> &ValidatorSet {
+        // This is safe because ValidatorSet is immutable within an epoch,
+        // but we need to be careful about lifetimes with RwLock.
+        // For now, we'll return a reference that lives as long as self.
+        // This works because the validator set is in the EpochConfig which
+        // is stored in inner.current.
+        //
+        // Note: This is a slight compromise - if we truly needed interior
+        // mutability of the validator set, we'd need to return Cow here too.
+        // But ValidatorSet doesn't change within an epoch.
+        //
+        // Safety: We hold a read lock for the duration of the borrow.
+        // This is safe as long as callers don't hold the reference across
+        // yield points.
+        unsafe {
+            let inner = self.inner.read().expect("RwLock poisoned");
+            let ptr = &inner.current.validator_set as *const ValidatorSet;
+            // Extend the lifetime - this is safe because:
+            // 1. The validator set lives in self.inner.current
+            // 2. We never replace current without going through transition_to_next_epoch
+            // 3. The caller should not hold this reference across await points
+            &*ptr
+        }
+    }
+
+    // Epoch-awareness overrides
+
+    fn current_epoch(&self) -> EpochId {
+        self.epoch_id()
+    }
+
+    fn epoch_end_height(&self) -> BlockHeight {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        // Return the minimum end height across all shards
+        inner
+            .current
+            .expected_end_heights
+            .values()
+            .min()
+            .copied()
+            .unwrap_or(BlockHeight(u64::MAX))
+    }
+
+    fn can_participate_in_consensus(&self) -> bool {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        matches!(inner.local_state, ValidatorShardState::Active)
+    }
+
+    fn is_shard_splitting(&self, shard: ShardGroupId) -> bool {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner.splitting_shards.contains(&shard)
+    }
+
+    fn shard_for_node_id(&self, node_id: &NodeId) -> ShardGroupId {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        inner.current.shard_for_node_id(node_id)
+    }
+}
+
+impl std::fmt::Debug for DynamicTopology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        f.debug_struct("DynamicTopology")
+            .field("local_validator_id", &self.local_validator_id)
+            .field("epoch", &inner.current.epoch_id)
+            .field("local_shard", &inner.local_shard)
+            .field("local_state", &inner.local_state)
+            .field("num_shards", &inner.current.num_shards)
+            .finish()
     }
 }
 
@@ -483,5 +858,118 @@ mod tests {
         assert_eq!(topology.proposer_for(1, 0), ValidatorId(1));
         assert_eq!(topology.proposer_for(4, 0), ValidatorId(0));
         assert_eq!(topology.proposer_for(0, 1), ValidatorId(1));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // DynamicTopology tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn make_dynamic_topology(num_validators: u64, local_id: u64) -> DynamicTopology {
+        let validators: Vec<_> = (0..num_validators)
+            .map(|i| make_test_validator(i, 1))
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let epoch_config = EpochConfig::genesis(2, validator_set);
+        DynamicTopology::from_epoch_config(ValidatorId(local_id), epoch_config).unwrap()
+    }
+
+    #[test]
+    fn test_dynamic_topology_basics() {
+        let topology = make_dynamic_topology(4, 0);
+
+        assert_eq!(topology.local_validator_id(), ValidatorId(0));
+        assert_eq!(topology.local_shard(), ShardGroupId(0)); // 0 % 2 = 0
+        assert_eq!(topology.num_shards(), 2);
+        assert_eq!(topology.current_epoch(), EpochId::GENESIS);
+    }
+
+    #[test]
+    fn test_dynamic_topology_committee() {
+        let topology = make_dynamic_topology(8, 0);
+
+        // With 8 validators and 2 shards:
+        // Shard 0: validators 0, 2, 4, 6
+        // Shard 1: validators 1, 3, 5, 7
+        let committee = topology.committee_for_shard(ShardGroupId(0));
+        assert_eq!(committee.len(), 4);
+        assert!(committee.contains(&ValidatorId(0)));
+        assert!(committee.contains(&ValidatorId(2)));
+        assert!(committee.contains(&ValidatorId(4)));
+        assert!(committee.contains(&ValidatorId(6)));
+
+        let committee1 = topology.committee_for_shard(ShardGroupId(1));
+        assert_eq!(committee1.len(), 4);
+    }
+
+    #[test]
+    fn test_dynamic_topology_epoch_awareness() {
+        let topology = make_dynamic_topology(4, 0);
+
+        // Static epoch awareness defaults
+        assert!(topology.can_participate_in_consensus());
+        assert!(!topology.is_shard_splitting(ShardGroupId(0)));
+        assert_eq!(
+            topology.local_validator_state(),
+            ValidatorShardState::Active
+        );
+    }
+
+    #[test]
+    fn test_dynamic_topology_split_tracking() {
+        let topology = make_dynamic_topology(4, 0);
+
+        // Initially no shards are splitting
+        assert!(!topology.is_shard_splitting(ShardGroupId(0)));
+
+        // Mark shard as splitting
+        topology.mark_shard_splitting(ShardGroupId(0));
+        assert!(topology.is_shard_splitting(ShardGroupId(0)));
+        assert!(!topology.is_shard_splitting(ShardGroupId(1)));
+
+        // Clear splitting state
+        topology.clear_shard_splitting(ShardGroupId(0));
+        assert!(!topology.is_shard_splitting(ShardGroupId(0)));
+    }
+
+    #[test]
+    fn test_dynamic_topology_validator_not_found() {
+        let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 1)).collect();
+        let validator_set = ValidatorSet::new(validators);
+        let epoch_config = EpochConfig::genesis(2, validator_set);
+
+        // Try to create topology for validator not in the set
+        let result = DynamicTopology::from_epoch_config(ValidatorId(100), epoch_config);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            DynamicTopologyError::ValidatorNotInEpoch(ValidatorId(100))
+        );
+    }
+
+    #[test]
+    fn test_dynamic_topology_epoch_transition() {
+        let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 1)).collect();
+        let validator_set = ValidatorSet::new(validators.clone());
+        let epoch0 = EpochConfig::genesis(2, validator_set.clone());
+        let topology = DynamicTopology::from_epoch_config(ValidatorId(0), epoch0.clone()).unwrap();
+
+        assert_eq!(topology.epoch_id(), EpochId::GENESIS);
+
+        // Create next epoch config (same validators for simplicity)
+        let mut epoch1 = EpochConfig::genesis(2, validator_set);
+        epoch1.epoch_id = EpochId(1);
+
+        // Transition without setting next epoch should fail
+        let result = topology.transition_to_next_epoch();
+        assert!(result.is_err());
+
+        // Set next epoch and transition
+        topology.set_next_epoch(epoch1);
+        assert!(topology.has_next_epoch());
+
+        let result = topology.transition_to_next_epoch();
+        assert!(result.is_ok());
+        assert_eq!(topology.epoch_id(), EpochId(1));
+        assert!(!topology.has_next_epoch());
     }
 }

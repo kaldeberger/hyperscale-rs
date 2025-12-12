@@ -37,6 +37,7 @@ use hyperscale_types::{
     StateVoteBlock, Topology, TransactionCertificate, TransactionDecision, TransactionStatus,
     ValidatorId,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,7 +180,7 @@ impl ExecutionState {
     }
 
     /// Get the local committee.
-    fn committee(&self) -> &[ValidatorId] {
+    fn committee(&self) -> Cow<'_, [ValidatorId]> {
         self.topology.local_committee()
     }
 

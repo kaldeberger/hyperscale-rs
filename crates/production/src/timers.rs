@@ -16,6 +16,7 @@ fn timer_event(id: TimerId) -> Event {
         TimerId::Proposal => Event::ProposalTimer,
         TimerId::ViewChange => Event::ViewChangeTimer,
         TimerId::Cleanup => Event::CleanupTimer,
+        TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
     }
 }
 

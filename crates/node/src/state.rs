@@ -589,6 +589,122 @@ impl StateMachine for NodeStateMachine {
                     return actions;
                 }
             }
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // Global Consensus / Epoch Events
+            // TODO: Route to GlobalConsensusState when implemented
+            // ═══════════════════════════════════════════════════════════════════════
+            Event::GlobalConsensusTimer => {
+                // Will be handled by GlobalConsensusState
+                tracing::trace!("GlobalConsensusTimer - not yet implemented");
+            }
+
+            Event::GlobalBlockReceived { epoch, height, .. } => {
+                tracing::debug!(?epoch, ?height, "GlobalBlockReceived - not yet implemented");
+            }
+
+            Event::GlobalBlockVoteReceived {
+                block_hash, shard, ..
+            } => {
+                tracing::debug!(
+                    ?block_hash,
+                    ?shard,
+                    "GlobalBlockVoteReceived - not yet implemented"
+                );
+            }
+
+            Event::GlobalQcFormed { block_hash, epoch } => {
+                tracing::info!(?block_hash, ?epoch, "GlobalQcFormed - not yet implemented");
+            }
+
+            Event::EpochEndApproaching {
+                current_epoch,
+                end_height,
+            } => {
+                tracing::info!(
+                    ?current_epoch,
+                    ?end_height,
+                    "EpochEndApproaching - not yet implemented"
+                );
+                // TODO: Stop accepting new transactions, drain in-flight
+            }
+
+            Event::EpochTransitionReady {
+                from_epoch,
+                to_epoch,
+                ..
+            } => {
+                tracing::info!(
+                    ?from_epoch,
+                    ?to_epoch,
+                    "EpochTransitionReady - not yet implemented"
+                );
+                // TODO: Update DynamicTopology, notify subsystems
+            }
+
+            Event::EpochTransitionComplete {
+                new_epoch,
+                new_shard,
+                is_waiting,
+            } => {
+                tracing::info!(
+                    ?new_epoch,
+                    ?new_shard,
+                    is_waiting,
+                    "EpochTransitionComplete - not yet implemented"
+                );
+            }
+
+            Event::ValidatorSyncComplete { epoch, shard } => {
+                tracing::info!(
+                    ?epoch,
+                    ?shard,
+                    "ValidatorSyncComplete - not yet implemented"
+                );
+                // TODO: Transition from Waiting to Active state
+            }
+
+            Event::ShardSplitInitiated {
+                source_shard,
+                new_shard,
+                split_point,
+            } => {
+                tracing::info!(
+                    ?source_shard,
+                    ?new_shard,
+                    split_point,
+                    "ShardSplitInitiated - not yet implemented"
+                );
+                // TODO: Mark shard as splitting in topology
+            }
+
+            Event::ShardSplitComplete {
+                source_shard,
+                new_shard,
+            } => {
+                tracing::info!(
+                    ?source_shard,
+                    ?new_shard,
+                    "ShardSplitComplete - not yet implemented"
+                );
+            }
+
+            Event::ShardMergeInitiated {
+                shard_a,
+                shard_b,
+                merged_shard,
+            } => {
+                tracing::info!(
+                    ?shard_a,
+                    ?shard_b,
+                    ?merged_shard,
+                    "ShardMergeInitiated - not yet implemented"
+                );
+            }
+
+            Event::ShardMergeComplete { merged_shard } => {
+                tracing::info!(?merged_shard, "ShardMergeComplete - not yet implemented");
+            }
         }
 
         // Event not handled by any sub-machine

@@ -330,10 +330,10 @@ impl ProductionRunnerBuilder {
 
         // Register known validators for peer validation
         // This allows us to validate that messages come from known validators
-        for validator_id in topology.local_committee() {
-            if let Some(public_key) = topology.public_key(*validator_id) {
+        for &validator_id in topology.local_committee().iter() {
+            if let Some(public_key) = topology.public_key(validator_id) {
                 let peer_id = compute_peer_id_for_validator(&public_key);
-                network.register_validator(*validator_id, peer_id).await;
+                network.register_validator(validator_id, peer_id).await;
             }
         }
 
@@ -1371,6 +1371,79 @@ impl ProductionRunner {
                     let _ =
                         event_tx.blocking_send(Event::ChainMetadataFetched { height, hash, qc });
                 });
+            }
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // Global Consensus Actions (TODO: implement when GlobalConsensusState exists)
+            // ═══════════════════════════════════════════════════════════════════════
+            Action::ProposeGlobalBlock { epoch, height, .. } => {
+                tracing::trace!(?epoch, ?height, "ProposeGlobalBlock - not yet implemented");
+            }
+            Action::BroadcastGlobalBlockVote {
+                block_hash, shard, ..
+            } => {
+                tracing::trace!(
+                    ?block_hash,
+                    ?shard,
+                    "BroadcastGlobalBlockVote - not yet implemented"
+                );
+            }
+            Action::TransitionEpoch {
+                from_epoch,
+                to_epoch,
+                ..
+            } => {
+                tracing::debug!(
+                    ?from_epoch,
+                    ?to_epoch,
+                    "TransitionEpoch - not yet implemented"
+                );
+            }
+            Action::MarkValidatorReady { epoch, shard } => {
+                tracing::debug!(?epoch, ?shard, "MarkValidatorReady - not yet implemented");
+            }
+            Action::InitiateShardSplit {
+                source_shard,
+                new_shard,
+                split_point,
+            } => {
+                tracing::info!(
+                    ?source_shard,
+                    ?new_shard,
+                    split_point,
+                    "InitiateShardSplit - not yet implemented"
+                );
+            }
+            Action::CompleteShardSplit {
+                source_shard,
+                new_shard,
+            } => {
+                tracing::info!(
+                    ?source_shard,
+                    ?new_shard,
+                    "CompleteShardSplit - not yet implemented"
+                );
+            }
+            Action::InitiateShardMerge {
+                shard_a,
+                shard_b,
+                merged_shard,
+            } => {
+                tracing::info!(
+                    ?shard_a,
+                    ?shard_b,
+                    ?merged_shard,
+                    "InitiateShardMerge - not yet implemented"
+                );
+            }
+            Action::CompleteShardMerge { merged_shard } => {
+                tracing::info!(?merged_shard, "CompleteShardMerge - not yet implemented");
+            }
+            Action::PersistEpochConfig { .. } => {
+                tracing::debug!("PersistEpochConfig - not yet implemented");
+            }
+            Action::FetchEpochConfig { epoch } => {
+                tracing::debug!(?epoch, "FetchEpochConfig - not yet implemented");
             }
         }
 

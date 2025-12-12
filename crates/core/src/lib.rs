@@ -44,4 +44,6 @@ pub enum TimerId {
     ViewChange,
     /// Periodic cleanup timer
     Cleanup,
+    /// Global consensus timer (epoch management)
+    GlobalConsensus,
 }

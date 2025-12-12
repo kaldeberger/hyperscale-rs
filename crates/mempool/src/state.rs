@@ -582,18 +582,15 @@ impl MempoolState {
         let locked_nodes = locked.len() as u64;
         let blocked_count = self.blocked_by.len() as u64;
 
-        let pending_count = self
+        // Single pass over pending transactions to count both total and blocked
+        let (pending_count, pending_blocked) = self
             .pool
             .values()
             .filter(|e| e.status == TransactionStatus::Pending)
-            .count() as u64;
-
-        let pending_blocked = self
-            .pool
-            .values()
-            .filter(|e| e.status == TransactionStatus::Pending)
-            .filter(|e| self.conflicts_with_locked(&e.tx, &locked))
-            .count() as u64;
+            .fold((0u64, 0u64), |(total, blocked), e| {
+                let is_blocked = self.conflicts_with_locked(&e.tx, &locked);
+                (total + 1, blocked + is_blocked as u64)
+            });
 
         LockContentionStats {
             locked_nodes,

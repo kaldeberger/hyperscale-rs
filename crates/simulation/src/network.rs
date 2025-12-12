@@ -27,8 +27,8 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            intra_shard_latency: Duration::from_millis(10),
-            cross_shard_latency: Duration::from_millis(50),
+            intra_shard_latency: Duration::from_millis(150),
+            cross_shard_latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             validators_per_shard: 4,
             num_shards: 2,

@@ -5,6 +5,14 @@
 //! - Deterministic simulated time (we control when time advances)
 //! - CPU parallelism (rayon processes nodes on multiple cores)
 //! - No scheduling issues (no tokio task coordination needed)
+//!
+//! Each step:
+//! 1. Advance time by 1ms and fire any due timers
+//! 2. Process events (single pass - no drain loop)
+//! 3. Collect and route messages
+//! 4. Collect status updates
+//!
+//! Events enqueued during processing wait until the next step.
 
 use crate::config::ParallelConfig;
 use crate::metrics::SimulationReport;
@@ -12,18 +20,94 @@ use crate::router::Destination;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
-use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage};
+use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, KeyPair, PartitionNumber, PublicKey, QuorumCertificate,
     RoutableTransaction, ShardGroupId, Signature, StaticTopology, Topology, TransactionDecision,
     TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info};
+
+/// A pending message waiting for delivery at a scheduled time.
+#[derive(Debug)]
+struct PendingMessage {
+    /// When this message should be delivered (simulated time).
+    delivery_time: Duration,
+    /// Recipient node index.
+    recipient: u32,
+    /// The message to deliver.
+    message: Arc<OutboundMessage>,
+}
+
+/// Wrapper for BinaryHeap that orders by earliest delivery time first.
+#[derive(Debug)]
+struct MessageQueue {
+    /// Messages ordered by delivery_time (earliest first via Reverse ordering).
+    messages: BinaryHeap<std::cmp::Reverse<PendingMessageOrd>>,
+}
+
+/// Wrapper for ordering PendingMessage by delivery_time.
+#[derive(Debug)]
+struct PendingMessageOrd(PendingMessage);
+
+impl PartialEq for PendingMessageOrd {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.delivery_time == other.0.delivery_time
+    }
+}
+
+impl Eq for PendingMessageOrd {}
+
+impl PartialOrd for PendingMessageOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingMessageOrd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.delivery_time.cmp(&other.0.delivery_time)
+    }
+}
+
+impl MessageQueue {
+    fn new() -> Self {
+        Self {
+            messages: BinaryHeap::new(),
+        }
+    }
+
+    fn push(&mut self, msg: PendingMessage) {
+        self.messages
+            .push(std::cmp::Reverse(PendingMessageOrd(msg)));
+    }
+
+    /// Pop all messages ready for delivery at the given time.
+    fn pop_ready(&mut self, now: Duration) -> Vec<PendingMessage> {
+        let mut ready = Vec::new();
+        while let Some(std::cmp::Reverse(PendingMessageOrd(msg))) = self.messages.peek() {
+            if msg.delivery_time <= now {
+                let std::cmp::Reverse(PendingMessageOrd(msg)) = self.messages.pop().unwrap();
+                ready.push(msg);
+            } else {
+                break;
+            }
+        }
+        ready
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
+}
 
 /// A simulated node in the parallel simulator.
 pub struct SimNode {
@@ -73,42 +157,47 @@ impl SimNode {
         self.inbound_queue.push_back(message);
     }
 
-    /// Process all pending events until the queues are empty.
+    /// Process pending events (single pass, no drain loop).
+    ///
+    /// Processes all events that were queued before this call, but events
+    /// enqueued during processing wait until the next step. This models
+    /// realistic timing where internal event propagation takes some time.
+    ///
     /// Returns the number of events processed.
-    pub fn drain_events(&mut self) -> usize {
-        let mut total_processed = 0;
+    pub fn process_events(&mut self) -> usize {
+        let mut processed = 0;
 
-        loop {
-            let mut processed = 0;
+        // Snapshot queue lengths - only process events queued before this call
+        let internal_count = self.internal_queue.len();
+        let inbound_count = self.inbound_queue.len();
+        let tx_count = self.tx_queue.len();
 
-            // Process internal events first (highest priority)
-            while let Some(event) = self.internal_queue.pop_front() {
+        // Process internal events first (highest priority)
+        for _ in 0..internal_count {
+            if let Some(event) = self.internal_queue.pop_front() {
                 self.handle_event(event);
                 processed += 1;
             }
+        }
 
-            // Process inbound messages
-            while let Some(msg) = self.inbound_queue.pop_front() {
+        // Process inbound messages
+        for _ in 0..inbound_count {
+            if let Some(msg) = self.inbound_queue.pop_front() {
                 let event = msg.to_received_event();
                 self.handle_event(event);
                 processed += 1;
             }
+        }
 
-            // Process transaction submissions
-            while let Some(event) = self.tx_queue.pop_front() {
+        // Process transaction submissions
+        for _ in 0..tx_count {
+            if let Some(event) = self.tx_queue.pop_front() {
                 self.handle_event(event);
                 processed += 1;
             }
-
-            total_processed += processed;
-
-            // If nothing was processed, we're done
-            if processed == 0 {
-                break;
-            }
         }
 
-        total_processed
+        processed
     }
 
     /// Take outbound messages (clears the buffer).
@@ -458,11 +547,11 @@ impl SimNode {
 ///
 /// Processes nodes synchronously in a step-based loop, using rayon to
 /// parallelize event processing across CPU cores. Each step:
-/// 1. Processes all pending events on all nodes (in parallel)
-/// 2. Collects outbound messages
-/// 3. Routes messages to recipients
-/// 4. Collects transaction status updates
-/// 5. Advances simulated time and fires due timers
+/// 1. Advances simulated time and fires due timers
+/// 2. Delivers messages that have reached their delivery time
+/// 3. Processes all pending events on all nodes (in parallel)
+/// 4. Collects outbound messages and schedules them with network latency
+/// 5. Collects transaction status updates
 pub struct ParallelSimulator {
     config: ParallelConfig,
     nodes: Vec<SimNode>,
@@ -482,11 +571,19 @@ pub struct ParallelSimulator {
     submission_times: HashMap<Hash, Duration>,
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
+    /// Pending messages waiting for delivery (with network latency).
+    pending_messages: MessageQueue,
+    /// Simulated network for latency/loss/partition modeling.
+    network: SimulatedNetwork,
+    /// RNG for network latency jitter (seeded for determinism).
+    rng: ChaCha8Rng,
 }
 
 impl ParallelSimulator {
     /// Create a new parallel simulator.
     pub fn new(config: ParallelConfig) -> Self {
+        let rng = ChaCha8Rng::seed_from_u64(config.seed.wrapping_add(0xDEAD_BEEF));
+        let network = SimulatedNetwork::new(config.network.clone());
         Self {
             config,
             nodes: Vec::new(),
@@ -499,6 +596,9 @@ impl ParallelSimulator {
             latencies: Vec::new(),
             submission_times: HashMap::new(),
             traffic_analyzer: None,
+            pending_messages: MessageQueue::new(),
+            network,
+            rng,
         }
     }
 
@@ -656,16 +756,36 @@ impl ParallelSimulator {
     }
 
     /// Run one step of the simulation.
+    ///
+    /// Each step represents 1ms of simulated time:
+    /// 1. Advance time and fire any due timers
+    /// 2. Deliver messages that have reached their delivery time
+    /// 3. Process events (single pass - newly enqueued events wait for next step)
+    /// 4. Collect outbound messages and schedule with network latency
+    /// 5. Collect transaction status updates
+    ///
     /// Returns the number of events processed across all nodes.
     pub fn step(&mut self) -> usize {
-        // Step 1: Process all nodes in parallel
+        // Step 1: Advance simulated time and fire due timers on all nodes
+        self.simulated_time += Duration::from_millis(1);
+        for node in &mut self.nodes {
+            node.advance_time(self.simulated_time);
+        }
+
+        // Step 2: Deliver messages that have reached their delivery time
+        let ready_messages = self.pending_messages.pop_ready(self.simulated_time);
+        for msg in ready_messages {
+            self.nodes[msg.recipient as usize].deliver_message(msg.message);
+        }
+
+        // Step 3: Process all nodes in parallel (single pass)
         let events_processed: usize = self
             .nodes
             .par_iter_mut()
-            .map(|node| node.drain_events())
+            .map(|node| node.process_events())
             .sum();
 
-        // Step 2: Collect outbound messages from all nodes
+        // Step 4: Collect outbound messages from all nodes
         let mut all_messages: Vec<(u32, Destination, Arc<OutboundMessage>)> = Vec::new();
         for (i, node) in self.nodes.iter_mut().enumerate() {
             for (dest, msg) in node.take_outbound_messages() {
@@ -673,7 +793,7 @@ impl ParallelSimulator {
             }
         }
 
-        // Step 3: Route messages to recipients (and record traffic if enabled)
+        // Step 5: Schedule messages for delivery with network latency
         for (from, dest, msg) in all_messages {
             let recipients = self.get_recipients(from, &dest);
             for recipient in recipients {
@@ -688,11 +808,20 @@ impl ParallelSimulator {
                         recipient,
                     );
                 }
-                self.nodes[recipient as usize].deliver_message(msg.clone());
+
+                // Calculate delivery time based on network latency
+                let latency = self.network.sample_latency(from, recipient, &mut self.rng);
+                let delivery_time = self.simulated_time + latency;
+
+                self.pending_messages.push(PendingMessage {
+                    delivery_time,
+                    recipient,
+                    message: msg.clone(),
+                });
             }
         }
 
-        // Step 4: Collect status updates
+        // Step 6: Collect status updates
         for node in &mut self.nodes {
             for (tx_hash, status) in node.take_status_updates() {
                 if self.in_flight.remove(&tx_hash) {
@@ -721,12 +850,6 @@ impl ParallelSimulator {
                     }
                 }
             }
-        }
-
-        // Step 5: Advance simulated time and fire due timers on all nodes
-        self.simulated_time += Duration::from_millis(1);
-        for node in &mut self.nodes {
-            node.advance_time(self.simulated_time);
         }
 
         events_processed

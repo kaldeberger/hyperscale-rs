@@ -913,51 +913,8 @@ impl BftState {
                 }
             }
 
-            // For non-genesis QC, delegate signature verification before voting.
-            // This is CRITICAL for BFT safety - prevents Byzantine proposers from
-            // including fake QCs with invalid signatures.
-            if !header.parent_qc.is_genesis() {
-                // Check if we already have pending verification for this block
-                if self.pending_qc_verifications.contains_key(&block_hash) {
-                    trace!("QC verification already pending for block {}", block_hash);
-                    return actions;
-                }
-
-                // Collect public keys for verification
-                let Some(public_keys) = self.collect_qc_signer_keys(&header.parent_qc) else {
-                    warn!("Failed to collect public keys for QC verification");
-                    return actions;
-                };
-
-                // Store pending verification info
-                self.pending_qc_verifications.insert(
-                    block_hash,
-                    PendingQcVerification {
-                        header: header.clone(),
-                    },
-                );
-
-                // Construct signing message with domain separation
-                let signing_message = Self::block_vote_message(
-                    self.shard_group,
-                    header.parent_qc.height.0,
-                    header.parent_qc.round,
-                    &header.parent_qc.block_hash,
-                );
-
-                // Delegate verification to runner
-                actions.push(Action::VerifyQcSignature {
-                    qc: header.parent_qc.clone(),
-                    public_keys,
-                    block_hash,
-                    signing_message,
-                });
-
-                return actions;
-            }
-
-            // Genesis QC - vote directly (no signature to verify)
-            actions.extend(self.try_vote_on_block(block_hash, height, round));
+            // Trigger QC verification (for non-genesis) or vote directly (for genesis)
+            actions.extend(self.trigger_qc_verification_or_vote(block_hash));
             return actions;
         }
 
@@ -1094,7 +1051,77 @@ impl BftState {
         Ok(())
     }
 
-    /// Try to vote on a block after it's complete.
+    /// Trigger QC verification (if needed) and then vote on a complete block.
+    ///
+    /// This is the single entry point for voting on a block after it becomes complete.
+    /// It handles:
+    /// 1. Non-genesis QC: Triggers async signature verification, vote happens in callback
+    /// 2. Genesis QC: Votes directly (no signature to verify)
+    ///
+    /// SAFETY: This must be called instead of `try_vote_on_block` directly to ensure
+    /// QC signatures are always verified before voting.
+    fn trigger_qc_verification_or_vote(&mut self, block_hash: Hash) -> Vec<Action> {
+        let Some(pending) = self.pending_blocks.get(&block_hash) else {
+            warn!(
+                "trigger_qc_verification_or_vote: no pending block for {}",
+                block_hash
+            );
+            return vec![];
+        };
+
+        let header = pending.header().clone();
+        let height = header.height.0;
+        let round = header.round;
+
+        // For non-genesis QC, delegate signature verification before voting.
+        // This is CRITICAL for BFT safety - prevents Byzantine proposers from
+        // including fake QCs with invalid signatures.
+        if !header.parent_qc.is_genesis() {
+            // Check if we already have pending verification for this block
+            if self.pending_qc_verifications.contains_key(&block_hash) {
+                trace!("QC verification already pending for block {}", block_hash);
+                return vec![];
+            }
+
+            // Collect public keys for verification
+            let Some(public_keys) = self.collect_qc_signer_keys(&header.parent_qc) else {
+                warn!("Failed to collect public keys for QC verification");
+                return vec![];
+            };
+
+            // Store pending verification info
+            self.pending_qc_verifications.insert(
+                block_hash,
+                PendingQcVerification {
+                    header: header.clone(),
+                },
+            );
+
+            // Construct signing message with domain separation
+            let signing_message = Self::block_vote_message(
+                self.shard_group,
+                header.parent_qc.height.0,
+                header.parent_qc.round,
+                &header.parent_qc.block_hash,
+            );
+
+            // Delegate verification to runner
+            return vec![Action::VerifyQcSignature {
+                qc: header.parent_qc.clone(),
+                public_keys,
+                block_hash,
+                signing_message,
+            }];
+        }
+
+        // Genesis QC - vote directly (no signature to verify)
+        self.try_vote_on_block(block_hash, height, round)
+    }
+
+    /// Try to vote on a block after it's complete and QC is verified.
+    ///
+    /// NOTE: This should only be called after QC verification completes.
+    /// For the main entry point, use `trigger_qc_verification_or_vote`.
     fn try_vote_on_block(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
         // Check vote locking - have we already voted for a block at this height?
         // BFT Safety: A validator must NEVER vote for conflicting blocks at the same height,
@@ -2071,9 +2098,6 @@ impl BftState {
 
                 // Check if block is now complete
                 if pending.is_complete() {
-                    let height = pending.header().height.0;
-                    let round = pending.header().round;
-
                     // Construct block if needed
                     if pending.block().is_none() {
                         if let Err(e) = pending.construct_block() {
@@ -2089,8 +2113,11 @@ impl BftState {
                         "Pending block completed after transaction arrived"
                     );
 
-                    // Try to vote on the now-complete block
-                    actions.extend(self.try_vote_on_block(block_hash, height, round));
+                    // Trigger QC verification (for non-genesis) or vote directly (for genesis)
+                    // This is CRITICAL: we must verify QC signatures before voting, even when
+                    // transactions arrive late. Previously this called try_vote_on_block directly,
+                    // which skipped QC verification - a safety bug.
+                    actions.extend(self.trigger_qc_verification_or_vote(block_hash));
                 }
             }
         }
@@ -2127,9 +2154,6 @@ impl BftState {
 
                 // Check if block is now complete
                 if pending.is_complete() {
-                    let height = pending.header().height.0;
-                    let round = pending.header().round;
-
                     // Construct block if needed
                     if pending.block().is_none() {
                         if let Err(e) = pending.construct_block() {
@@ -2145,8 +2169,11 @@ impl BftState {
                         "Pending block completed after certificate finalized"
                     );
 
-                    // Try to vote on the now-complete block
-                    actions.extend(self.try_vote_on_block(block_hash, height, round));
+                    // Trigger QC verification (for non-genesis) or vote directly (for genesis)
+                    // This is CRITICAL: we must verify QC signatures before voting, even when
+                    // certificates arrive late. Previously this called try_vote_on_block directly,
+                    // which skipped QC verification - a safety bug.
+                    actions.extend(self.trigger_qc_verification_or_vote(block_hash));
                 }
             }
         }

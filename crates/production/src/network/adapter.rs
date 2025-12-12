@@ -258,9 +258,13 @@ pub struct Libp2pAdapter {
     /// Command channel to swarm task.
     command_tx: mpsc::UnboundedSender<SwarmCommand>,
 
-    /// Event channel for incoming messages (sent to runner).
+    /// Consensus event channel for high-priority BFT messages (sent to runner).
     #[allow(dead_code)]
-    event_tx: mpsc::Sender<Event>,
+    consensus_tx: mpsc::Sender<Event>,
+
+    /// Transaction event channel for low-priority mempool messages (sent to runner).
+    #[allow(dead_code)]
+    transaction_tx: mpsc::Sender<Event>,
 
     /// Known validators (ValidatorId -> PeerId).
     /// Built from Topology at startup.
@@ -289,7 +293,8 @@ impl Libp2pAdapter {
     /// * `keypair` - Ed25519 keypair for libp2p identity (derived from validator key)
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
-    /// * `event_tx` - Channel to send incoming events to the runner
+    /// * `consensus_tx` - Channel for high-priority consensus events (BFT messages)
+    /// * `transaction_tx` - Channel for low-priority transaction events (mempool)
     /// * `tx_validator` - Transaction validator for signature verification
     ///
     /// # Returns
@@ -301,7 +306,8 @@ impl Libp2pAdapter {
         keypair: identity::Keypair,
         validator_id: ValidatorId,
         shard: ShardGroupId,
-        event_tx: mpsc::Sender<Event>,
+        consensus_tx: mpsc::Sender<Event>,
+        transaction_tx: mpsc::Sender<Event>,
         tx_validator: Arc<TransactionValidation>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<InboundSyncRequest>), NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
@@ -393,7 +399,8 @@ impl Libp2pAdapter {
             local_validator_id: validator_id,
             local_shard: shard,
             command_tx,
-            event_tx: event_tx.clone(),
+            consensus_tx: consensus_tx.clone(),
+            transaction_tx: transaction_tx.clone(),
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
             request_timeout: config.request_timeout,
@@ -407,7 +414,8 @@ impl Libp2pAdapter {
         tokio::spawn(Self::event_loop(
             swarm,
             command_rx,
-            event_tx,
+            consensus_tx,
+            transaction_tx,
             peer_validators,
             shutdown_rx,
             sync_request_tx,
@@ -598,7 +606,8 @@ impl Libp2pAdapter {
     async fn event_loop(
         mut swarm: Swarm<Behaviour>,
         mut command_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-        event_tx: mpsc::Sender<Event>,
+        consensus_tx: mpsc::Sender<Event>,
+        transaction_tx: mpsc::Sender<Event>,
         peer_validators: Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
         mut shutdown_rx: mpsc::Receiver<()>,
         sync_request_tx: mpsc::Sender<InboundSyncRequest>,
@@ -635,7 +644,8 @@ impl Libp2pAdapter {
                 event = swarm.select_next_some() => {
                     Self::handle_swarm_event(
                         event,
-                        &event_tx,
+                        &consensus_tx,
+                        &transaction_tx,
                         &peer_validators,
                         &mut pending_requests,
                         &mut pending_response_channels,
@@ -727,7 +737,8 @@ impl Libp2pAdapter {
     #[allow(clippy::too_many_arguments)]
     async fn handle_swarm_event(
         event: SwarmEvent<BehaviourEvent>,
-        event_tx: &mpsc::Sender<Event>,
+        consensus_tx: &mpsc::Sender<Event>,
+        transaction_tx: &mpsc::Sender<Event>,
         peer_validators: &Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
         pending_requests: &mut HashMap<
             request_response::OutboundRequestId,
@@ -815,13 +826,24 @@ impl Libp2pAdapter {
                             };
 
                         // Send the event if validation passed
+                        // Route to appropriate channel based on event type:
+                        // - Transaction events go to low-priority transaction channel
+                        // - All other events (BFT, execution) go to high-priority consensus channel
                         if let Some(event) = event_to_send {
+                            let is_transaction_event =
+                                matches!(event, Event::TransactionGossipReceived { .. });
+                            let target_tx = if is_transaction_event {
+                                transaction_tx
+                            } else {
+                                consensus_tx
+                            };
+
                             // Extract trace context for distributed tracing (when feature enabled)
                             // We attach the OpenTelemetry context, create a tracing span to capture it,
                             // then use Future::instrument to attach the span to the send future.
                             // This ensures the context is active during the async operation.
                             let send_future = async {
-                                if event_tx.send(event).await.is_err() {
+                                if target_tx.send(event).await.is_err() {
                                     warn!("Event channel closed");
                                 }
                             };

@@ -119,7 +119,8 @@ async fn test_network_adapter_starts() {
         ..Default::default()
     };
 
-    let (event_tx, _event_rx) = mpsc::channel(100);
+    let (consensus_tx, _consensus_rx) = mpsc::channel(100);
+    let (transaction_tx, _transaction_rx) = mpsc::channel(100);
 
     let result = timeout(
         CONNECTION_TIMEOUT,
@@ -128,7 +129,8 @@ async fn test_network_adapter_starts() {
             keypair,
             validator_id,
             shard,
-            event_tx,
+            consensus_tx,
+            transaction_tx,
             test_tx_validator(),
         ),
     )
@@ -163,14 +165,16 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let (event_tx1, _event_rx1) = mpsc::channel(100);
+    let (consensus_tx1, _consensus_rx1) = mpsc::channel(100);
+    let (transaction_tx1, _transaction_rx1) = mpsc::channel(100);
 
     let (adapter1, _sync_rx1) = Libp2pAdapter::new(
         config1,
         keypair1,
         ValidatorId(0),
         ShardGroupId(0),
-        event_tx1,
+        consensus_tx1,
+        transaction_tx1,
         test_tx_validator(),
     )
     .await
@@ -190,14 +194,16 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![node1_addr.clone()],
         ..Default::default()
     };
-    let (event_tx2, _event_rx2) = mpsc::channel(100);
+    let (consensus_tx2, _consensus_rx2) = mpsc::channel(100);
+    let (transaction_tx2, _transaction_rx2) = mpsc::channel(100);
 
     let (adapter2, _sync_rx2) = Libp2pAdapter::new(
         config2,
         keypair2,
         ValidatorId(1),
         ShardGroupId(0),
-        event_tx2,
+        consensus_tx2,
+        transaction_tx2,
         test_tx_validator(),
     )
     .await
@@ -245,14 +251,16 @@ async fn test_topic_subscription() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let (event_tx, _event_rx) = mpsc::channel(100);
+    let (consensus_tx, _consensus_rx) = mpsc::channel(100);
+    let (transaction_tx, _transaction_rx) = mpsc::channel(100);
 
     let (adapter, _sync_rx) = Libp2pAdapter::new(
         config,
         keypair,
         ValidatorId(0),
         ShardGroupId(0),
-        event_tx,
+        consensus_tx,
+        transaction_tx,
         test_tx_validator(),
     )
     .await

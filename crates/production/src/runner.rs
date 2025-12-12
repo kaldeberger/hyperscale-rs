@@ -307,7 +307,10 @@ impl ProductionRunnerBuilder {
             .ed25519_keypair
             .ok_or_else(|| RunnerError::SendError("network keypair is required".into()))?;
 
-        let (event_tx, event_rx) = mpsc::channel(self.channel_capacity);
+        // Separate channels for consensus (high priority) and transactions (low priority)
+        // This prevents transaction floods from starving consensus events
+        let (consensus_tx, consensus_rx) = mpsc::channel(self.channel_capacity);
+        let (transaction_tx, transaction_rx) = mpsc::channel(self.channel_capacity);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let validator_id = topology.local_validator_id();
         let local_shard = topology.local_shard();
@@ -326,7 +329,7 @@ impl ProductionRunnerBuilder {
             bft_config,
             recovered,
         );
-        let timer_manager = TimerManager::new(event_tx.clone());
+        let timer_manager = TimerManager::new(consensus_tx.clone());
 
         // Use configured network definition or default to simulator
         let network_definition = self
@@ -339,12 +342,14 @@ impl ProductionRunnerBuilder {
         ));
 
         // Create network adapter with transaction validation
+        // Pass both channels - consensus for BFT messages, transaction for mempool
         let (network, sync_request_rx) = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
             local_shard,
-            event_tx.clone(),
+            consensus_tx.clone(),
+            transaction_tx.clone(),
             tx_validator.clone(),
         )
         .await?;
@@ -361,16 +366,18 @@ impl ProductionRunnerBuilder {
             }
         }
 
-        // Create sync manager
+        // Create sync manager (uses consensus channel for sync events)
         let sync_manager =
-            SyncManager::new(SyncConfig::default(), network.clone(), event_tx.clone());
+            SyncManager::new(SyncConfig::default(), network.clone(), consensus_tx.clone());
 
         // Create executor
         let executor = Arc::new(RadixExecutor::new(network_definition));
 
         Ok(ProductionRunner {
-            event_rx,
-            event_tx,
+            consensus_rx,
+            consensus_tx,
+            transaction_rx,
+            transaction_tx,
             state,
             start_time: Instant::now(),
             thread_pools,
@@ -408,10 +415,14 @@ impl ProductionRunnerBuilder {
 /// Use [`ProductionRunner::builder()`] to construct a runner with all required
 /// dependencies.
 pub struct ProductionRunner {
-    /// Receives events from all sources.
-    event_rx: mpsc::Receiver<Event>,
-    /// Clone this to send events from network, timers, callbacks.
-    event_tx: mpsc::Sender<Event>,
+    /// Receives high-priority consensus events (BFT, timers, internal callbacks).
+    consensus_rx: mpsc::Receiver<Event>,
+    /// Clone this to send consensus events from timers, verification callbacks, etc.
+    consensus_tx: mpsc::Sender<Event>,
+    /// Receives low-priority transaction events (submissions, gossip).
+    transaction_rx: mpsc::Receiver<Event>,
+    /// Clone this to send transaction events (used by submit_transaction).
+    transaction_tx: mpsc::Sender<Event>,
     /// The state machine (owned, not shared).
     state: NodeStateMachine,
     /// Start time for calculating elapsed duration.
@@ -475,7 +486,7 @@ impl ProductionRunner {
 
     /// Get a sender for submitting events.
     pub fn event_sender(&self) -> mpsc::Sender<Event> {
-        self.event_tx.clone()
+        self.consensus_tx.clone()
     }
 
     /// Get the transaction validator for signature verification.
@@ -648,7 +659,8 @@ impl ProductionRunner {
 
         loop {
             // Use biased select for priority: consensus events are always checked first.
-            // After CONSENSUS_BATCH_SIZE events, we yield to sync to prevent starvation.
+            // After CONSENSUS_BATCH_SIZE events, we yield to lower-priority work.
+            // Transaction events are processed only when consensus channel is empty.
             tokio::select! {
                 biased;
 
@@ -658,9 +670,9 @@ impl ProductionRunner {
                     break;
                 }
 
-                // HIGH PRIORITY: Handle incoming consensus events
+                // HIGH PRIORITY: Handle incoming consensus events (BFT, timers, internal)
                 // Only check this branch if we haven't hit the batch limit
-                event = self.event_rx.recv(), if consensus_batch_count < CONSENSUS_BATCH_SIZE => {
+                event = self.consensus_rx.recv(), if consensus_batch_count < CONSENSUS_BATCH_SIZE => {
                     match event {
                         Some(event) => {
                             consensus_batch_count += 1;
@@ -728,9 +740,9 @@ impl ProductionRunner {
                                 }
                             }
 
-                            // Try to collect more verifications from queued events
+                            // Try to collect more verifications from queued consensus events
                             // This drains any immediately available events to maximize batch size
-                            while let Ok(more_event) = self.event_rx.try_recv() {
+                            while let Ok(more_event) = self.consensus_rx.try_recv() {
                                 consensus_batch_count += 1;
 
                                 // Update time for each event
@@ -777,6 +789,45 @@ impl ProductionRunner {
                             break;
                         }
                     }
+                }
+
+                // LOW PRIORITY: Handle transaction events (submissions, gossip)
+                // Only processed when consensus channel is empty or after batch limit
+                Some(event) = self.transaction_rx.recv() => {
+                    let event_type = event.type_name();
+                    let event_span = span!(
+                        Level::INFO,
+                        "handle_event",
+                        event.type = %event_type,
+                        node = self.state.node_index(),
+                        shard = ?self.state.shard(),
+                        otel.kind = "INTERNAL",
+                    );
+                    let _event_guard = event_span.enter();
+
+                    // Update time
+                    let now = self.start_time.elapsed();
+                    self.state.set_time(now);
+
+                    // Process transaction event
+                    let actions = self.state.handle(event);
+
+                    if !actions.is_empty() {
+                        tracing::info!(
+                            event_type = %event_type,
+                            num_actions = actions.len(),
+                            "Event produced actions"
+                        );
+                    }
+
+                    for action in actions {
+                        if let Err(e) = self.process_action(action).await {
+                            tracing::error!(error = ?e, "Error processing action");
+                        }
+                    }
+
+                    // Reset batch counter after processing transactions
+                    consensus_batch_count = 0;
                 }
 
                 // LOW PRIORITY: Handle inbound sync requests from peers
@@ -888,7 +939,7 @@ impl ProductionRunner {
                 public_key,
                 signing_message,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Verify vote signature against domain-separated message
@@ -907,7 +958,7 @@ impl ProductionRunner {
                 provision,
                 public_key,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message (must match ExecutionState::sign_provision)
@@ -926,7 +977,7 @@ impl ProductionRunner {
             }
 
             Action::VerifyStateVoteSignature { vote, public_key } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message (must match ExecutionState::create_vote)
@@ -948,7 +999,7 @@ impl ProductionRunner {
                 certificate,
                 public_keys,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message - StateCertificates aggregate signatures
@@ -995,7 +1046,7 @@ impl ProductionRunner {
                 block_hash,
                 signing_message,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Get signer keys based on QC's signer bitfield
@@ -1035,7 +1086,7 @@ impl ProductionRunner {
                 public_key,
                 signing_message,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     let valid = public_key.verify(&signing_message, &vote.signature);
@@ -1055,7 +1106,7 @@ impl ProductionRunner {
                 public_keys,
                 signing_message,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Get signer keys based on the highest_qc's signer bitfield
@@ -1093,7 +1144,7 @@ impl ProductionRunner {
                 public_keys,
                 signing_message,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Verify aggregated BLS signature on the view change certificate
@@ -1129,7 +1180,7 @@ impl ProductionRunner {
                 transactions,
                 state_root: _,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
 
@@ -1180,7 +1231,7 @@ impl ProductionRunner {
                 transaction,
                 provisions,
             } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
                 let topology = self.topology.clone();
@@ -1239,7 +1290,7 @@ impl ProductionRunner {
             // Merkle computation on execution pool (can be parallelized internally)
             // Note: This action is currently not emitted by any state machine.
             Action::ComputeMerkleRoot { tx_hash, writes } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
 
                 self.thread_pools.spawn_execution(move || {
                     // Simple merkle root computation using hash chain
@@ -1263,9 +1314,9 @@ impl ProductionRunner {
                 });
             }
 
-            // Internal events go back through the channel
+            // Internal events go back through the consensus channel (high priority)
             Action::EnqueueInternal { event } => {
-                self.event_tx
+                self.consensus_tx
                     .send(event)
                     .await
                     .map_err(|e| RunnerError::SendError(e.to_string()))?;
@@ -1370,7 +1421,7 @@ impl ProductionRunner {
             // Storage reads - delegate to async storage, send callback event
             // ═══════════════════════════════════════════════════════════════════════
             Action::FetchStateEntries { tx_hash, nodes } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
 
@@ -1382,7 +1433,7 @@ impl ProductionRunner {
             }
 
             Action::FetchBlock { height } => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 let storage = self.storage.clone();
 
                 tokio::task::spawn_blocking(move || {
@@ -1393,7 +1444,7 @@ impl ProductionRunner {
             }
 
             Action::FetchChainMetadata => {
-                let event_tx = self.event_tx.clone();
+                let event_tx = self.consensus_tx.clone();
                 let storage = self.storage.clone();
 
                 tokio::task::spawn_blocking(move || {
@@ -1494,7 +1545,7 @@ impl ProductionRunner {
             return;
         }
 
-        let event_tx = self.event_tx.clone();
+        let event_tx = self.consensus_tx.clone();
         let batch_size = pending.total_count();
 
         self.thread_pools.spawn_crypto(move || {
@@ -1703,8 +1754,10 @@ impl ProductionRunner {
     /// Submit a transaction.
     ///
     /// The transaction status can be queried via the RPC status cache.
+    /// Transactions are sent to the low-priority transaction channel to avoid
+    /// starving consensus events during high transaction load.
     pub async fn submit_transaction(&mut self, tx: RoutableTransaction) -> Result<(), RunnerError> {
-        self.event_tx
+        self.transaction_tx
             .send(Event::SubmitTransaction {
                 tx: std::sync::Arc::new(tx),
             })

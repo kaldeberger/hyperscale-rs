@@ -159,7 +159,11 @@ impl Spammer {
 
         // Finalize latency tracking
         let latency_report = if let Some(tracker) = self.latency_tracker.take() {
-            Some(tracker.finalize().await)
+            Some(
+                tracker
+                    .finalize(self.config.latency_finalization_timeout)
+                    .await,
+            )
         } else {
             None
         };

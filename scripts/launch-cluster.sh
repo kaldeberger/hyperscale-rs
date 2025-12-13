@@ -201,7 +201,7 @@ data_dir = "$NODE_DATA_DIR"
 [network]
 listen_addr = "/ip4/0.0.0.0/udp/$p2p_port/quic-v1"
 bootstrap_peers = [$BOOTSTRAP_PEERS]
-request_timeout_ms = 30000
+request_timeout_ms = 500
 max_message_size = 10485760
 gossipsub_heartbeat_ms = 100
 

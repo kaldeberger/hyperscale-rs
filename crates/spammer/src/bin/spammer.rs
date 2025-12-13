@@ -104,6 +104,14 @@ enum Commands {
         /// Only used if --measure-latency is set.
         #[arg(long, default_value = "100ms")]
         latency_poll_interval: humantime::Duration,
+
+        /// Timeout for waiting for in-flight transactions after spammer stops (e.g., "30s")
+        ///
+        /// After the spammer finishes submitting, it waits this long for tracked
+        /// transactions to complete before marking them as timed out.
+        /// Only used if --measure-latency is set.
+        #[arg(long, default_value = "30s")]
+        latency_timeout: humantime::Duration,
     },
 
     /// Submit a single transaction and wait for it to complete (smoke test)
@@ -184,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             measure_latency,
             latency_sample_rate,
             latency_poll_interval,
+            latency_timeout,
         } => {
             // Initialize tracing for the run command
             tracing_subscriber::fmt::init();
@@ -207,7 +216,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config = config
                     .with_latency_tracking(true)
                     .with_latency_sample_rate(latency_sample_rate)
-                    .with_latency_poll_interval(*latency_poll_interval);
+                    .with_latency_poll_interval(*latency_poll_interval)
+                    .with_latency_finalization_timeout(*latency_timeout);
             }
 
             let mut spammer = Spammer::new(config)?;

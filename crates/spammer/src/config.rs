@@ -51,6 +51,9 @@ pub struct SpammerConfig {
 
     /// Poll interval for checking transaction status.
     pub latency_poll_interval: Duration,
+
+    /// Timeout for waiting for in-flight transactions to complete after spammer stops.
+    pub latency_finalization_timeout: Duration,
 }
 
 impl Default for SpammerConfig {
@@ -73,6 +76,7 @@ impl Default for SpammerConfig {
             latency_tracking: false,
             latency_sample_rate: 0.01,
             latency_poll_interval: Duration::from_millis(100),
+            latency_finalization_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -155,6 +159,12 @@ impl SpammerConfig {
     /// Set the poll interval for latency tracking.
     pub fn with_latency_poll_interval(mut self, interval: Duration) -> Self {
         self.latency_poll_interval = interval;
+        self
+    }
+
+    /// Set the finalization timeout for latency tracking.
+    pub fn with_latency_finalization_timeout(mut self, timeout: Duration) -> Self {
+        self.latency_finalization_timeout = timeout;
         self
     }
 

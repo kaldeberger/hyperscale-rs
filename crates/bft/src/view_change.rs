@@ -82,10 +82,21 @@ pub struct ViewChangeState {
     /// Reset to 0 when height advances.
     base_round_for_height: u64,
 
-    /// The round we've broadcast a view change vote for (if any).
-    /// None means no vote broadcast yet for current height.
+    /// The round we've finalized (counted) our own view change vote for (if any).
+    /// None means no vote finalized yet for current height.
     /// This tracks which round we voted for, so we can vote again for higher rounds.
-    vote_broadcast_for_round: Option<u64>,
+    /// Note: This is separate from broadcasting - we may rebroadcast the same vote
+    /// multiple times on timer fires to handle message loss.
+    vote_finalized_for_round: Option<u64>,
+
+    /// The last view change vote we broadcast (if any).
+    /// Stored so we can rebroadcast on timer fires if quorum hasn't been reached.
+    /// This allows recovery from message loss without re-counting our vote.
+    last_broadcast_vote: Option<ViewChangeVote>,
+
+    /// Counter for broadcast nonce. Incremented on each broadcast to ensure
+    /// gossipsub sees each rebroadcast as a unique message (avoiding deduplication).
+    broadcast_nonce: u64,
 
     /// Collects view change votes: (height, new_round) -> map of voter -> (signature, highest_qc).
     vote_collector: HashMap<(u64, u64), BTreeMap<ValidatorId, (Signature, QuorumCertificate)>>,
@@ -129,7 +140,9 @@ impl ViewChangeState {
             current_round: 0,
             current_height: 0,
             base_round_for_height: 0,
-            vote_broadcast_for_round: None,
+            vote_finalized_for_round: None,
+            last_broadcast_vote: None,
+            broadcast_nonce: 0,
             vote_collector: HashMap::new(),
             highest_qc: QuorumCertificate::genesis(),
             highest_qc_collector: HashMap::new(),
@@ -264,8 +277,9 @@ impl ViewChangeState {
         // Update last progress time
         self.last_progress_time = self.now;
 
-        // Reset view change state - clear any pending vote broadcast
-        self.vote_broadcast_for_round = None;
+        // Reset view change state - clear any pending vote
+        self.vote_finalized_for_round = None;
+        self.last_broadcast_vote = None;
         self.cleanup_old_votes(height);
     }
 
@@ -294,28 +308,59 @@ impl ViewChangeState {
             return actions;
         }
 
+        let new_round = self.current_round + 1;
+
         info!(
             current_height = self.current_height,
             current_round = self.current_round,
+            new_round = new_round,
             timeout = ?timeout,
             "View change timer fired, triggering view change"
         );
 
-        // Create and broadcast view change vote
+        // Check if we can rebroadcast an existing vote for this round
+        if let Some(ref last_vote) = self.last_broadcast_vote {
+            if last_vote.new_view == new_round && last_vote.height.0 == self.current_height {
+                // Rebroadcast the same vote with incremented nonce - handles message loss
+                self.broadcast_nonce += 1;
+                debug!(
+                    height = last_vote.height.0,
+                    new_view = last_vote.new_view,
+                    nonce = self.broadcast_nonce,
+                    "Rebroadcasting view change vote"
+                );
+
+                let gossip =
+                    ViewChangeVoteGossip::with_nonce(last_vote.clone(), self.broadcast_nonce);
+                actions.push(Action::BroadcastToShard {
+                    shard: self.local_shard(),
+                    message: OutboundMessage::ViewChangeVote(gossip),
+                });
+
+                return actions;
+            }
+        }
+
+        // Create and broadcast a new view change vote
         if let Some(vote) = self.create_view_change_vote() {
+            self.broadcast_nonce += 1;
             debug!(
                 height = vote.height.0,
                 current_round = vote.current_round,
                 new_view = vote.new_view,
+                nonce = self.broadcast_nonce,
                 "Broadcasting view change vote"
             );
 
-            let gossip = ViewChangeVoteGossip { vote: vote.clone() };
+            let gossip = ViewChangeVoteGossip::with_nonce(vote.clone(), self.broadcast_nonce);
 
             actions.push(Action::BroadcastToShard {
                 shard: self.local_shard(),
                 message: OutboundMessage::ViewChangeVote(gossip),
             });
+
+            // Store for potential rebroadcast
+            self.last_broadcast_vote = Some(vote.clone());
 
             // Process our own vote directly (no verification needed - we just created it)
             // Skip the signature verification since we signed it ourselves
@@ -327,19 +372,20 @@ impl ViewChangeState {
 
     /// Create a view change vote for broadcasting.
     ///
-    /// Returns None if already broadcast a vote for this round or higher.
+    /// Returns None if already finalized (counted) a vote for this round or higher.
+    /// Note: The caller handles rebroadcasting via `last_broadcast_vote` if needed.
     pub fn create_view_change_vote(&mut self) -> Option<ViewChangeVote> {
         let height = BlockHeight(self.current_height);
         let current_round = self.current_round;
         let new_round = current_round + 1;
 
-        // Only create vote if we haven't already voted for this round or higher
-        if let Some(voted_round) = self.vote_broadcast_for_round {
-            if voted_round >= new_round {
+        // Only create vote if we haven't already finalized a vote for this round or higher
+        if let Some(finalized_round) = self.vote_finalized_for_round {
+            if finalized_round >= new_round {
                 return None;
             }
         }
-        self.vote_broadcast_for_round = Some(new_round);
+        self.vote_finalized_for_round = Some(new_round);
 
         // Sign the vote: (shard_group, height, new_round)
         let message = Self::view_change_message(self.shard_group, height, new_round);
@@ -705,9 +751,12 @@ impl ViewChangeState {
         // Update to new round
         self.current_round = new_round;
         self.last_progress_time = self.now;
-        // Note: We do NOT reset vote_broadcast_for_round here because we want to
-        // prevent voting for the same round again. The field tracks votes by round
-        // number, so voting for a higher round is still allowed.
+        // Note: We do NOT reset vote_finalized_for_round here because we want to
+        // prevent counting our vote for the same round again. The field tracks
+        // which round we've finalized, so voting for a higher round is still allowed.
+        // However, we DO clear last_broadcast_vote since we're now at a new round
+        // and any stored vote is for the old round.
+        self.last_broadcast_vote = None;
 
         info!(
             height = height,
@@ -940,7 +989,9 @@ impl ViewChangeState {
         // Apply the view change
         self.current_round = cert.new_round();
         self.last_progress_time = self.now;
-        // Note: We do NOT reset vote_broadcast_for_round here - same reason as apply_view_change.
+        // Note: We do NOT reset vote_finalized_for_round here - same reason as apply_view_change.
+        // Clear last_broadcast_vote since we're now at a new round.
+        self.last_broadcast_vote = None;
 
         info!(
             height = cert.height.0,
@@ -1277,7 +1328,7 @@ mod tests {
         assert!(vote1.is_some());
         let vote1 = vote1.unwrap();
         assert_eq!(vote1.new_view, 1);
-        assert_eq!(state.vote_broadcast_for_round, Some(1));
+        assert_eq!(state.vote_finalized_for_round, Some(1));
 
         // Second vote for same round should fail
         let vote1_again = state.create_view_change_vote();
@@ -1286,7 +1337,7 @@ mod tests {
         // Simulate view change completing to round 1
         state.current_round = 1;
         state.last_progress_time = state.now;
-        // Note: vote_broadcast_for_round is NOT reset by apply_view_change
+        // Note: vote_finalized_for_round is NOT reset by apply_view_change
 
         // Advance time so another view change is triggered
         state.now = Duration::from_secs(20);
@@ -1296,7 +1347,7 @@ mod tests {
         assert!(vote2.is_some());
         let vote2 = vote2.unwrap();
         assert_eq!(vote2.new_view, 2);
-        assert_eq!(state.vote_broadcast_for_round, Some(2));
+        assert_eq!(state.vote_finalized_for_round, Some(2));
 
         // Third vote for round 2 should fail
         let vote2_again = state.create_view_change_vote();
@@ -1305,8 +1356,8 @@ mod tests {
 
     #[traced_test]
     #[test]
-    fn test_vote_broadcast_reset_on_height_change() {
-        // When height changes (block committed), vote_broadcast_for_round should reset
+    fn test_vote_finalized_reset_on_height_change() {
+        // When height changes (block committed), vote_finalized_for_round should reset
         let (mut state, _) = make_test_state();
         state.current_height = 1;
         state.current_round = 0;
@@ -1316,13 +1367,14 @@ mod tests {
         // Vote for round 1
         let vote1 = state.create_view_change_vote();
         assert!(vote1.is_some());
-        assert_eq!(state.vote_broadcast_for_round, Some(1));
+        assert_eq!(state.vote_finalized_for_round, Some(1));
 
         // Simulate block commit at new height
         state.reset_timeout(2);
         assert_eq!(state.current_height, 2);
         assert_eq!(state.current_round, 0);
-        assert_eq!(state.vote_broadcast_for_round, None);
+        assert_eq!(state.vote_finalized_for_round, None);
+        assert!(state.last_broadcast_vote.is_none());
 
         // Advance time
         state.now = Duration::from_secs(20);
@@ -1333,5 +1385,117 @@ mod tests {
         let vote_new_height = vote_new_height.unwrap();
         assert_eq!(vote_new_height.height.0, 2);
         assert_eq!(vote_new_height.new_view, 1);
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_view_change_vote_rebroadcast() {
+        // Test that view change votes are rebroadcast on timer fires
+        // This handles message loss without re-counting our vote
+        let (mut state, _) = make_test_state();
+        state.current_height = 1;
+        state.current_round = 0;
+        state.now = Duration::from_secs(10);
+        state.last_progress_time = Duration::ZERO;
+
+        // First timer fire should create and broadcast a vote
+        let actions1 = state.on_view_change_timer();
+        assert!(actions1.len() >= 2, "Should have timer + broadcast actions");
+
+        // Check we stored the vote for rebroadcast
+        assert!(state.last_broadcast_vote.is_some());
+        let stored_vote = state.last_broadcast_vote.clone().unwrap();
+        assert_eq!(stored_vote.new_view, 1);
+        assert_eq!(stored_vote.height.0, 1);
+
+        // Verify vote was finalized
+        assert_eq!(state.vote_finalized_for_round, Some(1));
+
+        // Advance time for another timer fire (quorum not reached)
+        state.now = Duration::from_secs(20);
+        state.last_progress_time = Duration::ZERO;
+
+        // Second timer fire should rebroadcast the same vote
+        let actions2 = state.on_view_change_timer();
+        assert_eq!(
+            actions2.len(),
+            2,
+            "Should have timer + broadcast actions only (no finalize)"
+        );
+
+        // Find the broadcast action
+        let has_broadcast = actions2.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::ViewChangeVote(_),
+                    ..
+                }
+            )
+        });
+        assert!(has_broadcast, "Should rebroadcast vote");
+
+        // Vote should NOT be finalized again (no duplicate counting)
+        // The finalize_vote call would add more actions
+        let finalize_action_count = actions2
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::EnqueueInternal { .. } | Action::VerifyQcSignature { .. }
+                )
+            })
+            .count();
+        assert_eq!(finalize_action_count, 0, "Should not re-finalize vote");
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_view_change_clears_last_broadcast_on_round_advance() {
+        // When view change completes, last_broadcast_vote should be cleared
+        // so we don't rebroadcast an old vote for the previous round
+        let (mut state, _) = make_test_state();
+        state.current_height = 1;
+        state.current_round = 0;
+        state.now = Duration::from_secs(10);
+        state.last_progress_time = Duration::ZERO;
+
+        // Create and store a vote for round 1
+        let vote = state.create_view_change_vote().unwrap();
+        state.last_broadcast_vote = Some(vote.clone());
+        assert_eq!(state.last_broadcast_vote.as_ref().unwrap().new_view, 1);
+
+        // Simulate view change completing to round 1
+        // (This would normally happen via apply_view_change)
+        state.current_round = 1;
+        state.last_progress_time = state.now;
+        state.last_broadcast_vote = None; // This is what apply_view_change does
+
+        // Advance time enough to trigger view change (must exceed timeout)
+        // With base_timeout = 5s, current_round = 1, base_round_for_height = 0:
+        // exponent = 1 - 0 = 1, timeout = 5s * 2 = 10s
+        // We need elapsed > 10s to trigger view change
+        state.now = Duration::from_secs(25);
+        state.last_progress_time = Duration::from_secs(10); // 15s elapsed > 10s timeout
+
+        // Timer fire should create a NEW vote for round 2 (not rebroadcast round 1)
+        let actions = state.on_view_change_timer();
+
+        // Should have created a new vote
+        assert!(state.last_broadcast_vote.is_some());
+        assert_eq!(state.last_broadcast_vote.as_ref().unwrap().new_view, 2);
+        assert_eq!(state.vote_finalized_for_round, Some(2));
+
+        // Should have broadcast action
+        let has_broadcast = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::ViewChangeVote(_),
+                    ..
+                }
+            )
+        });
+        assert!(has_broadcast, "Should broadcast new vote for round 2");
     }
 }

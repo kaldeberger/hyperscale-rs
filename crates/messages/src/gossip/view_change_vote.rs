@@ -11,12 +11,28 @@ pub use hyperscale_types::ViewChangeVote;
 pub struct ViewChangeVoteGossip {
     /// The view change vote being gossiped
     pub vote: ViewChangeVote,
+    /// Nonce to allow rebroadcasting the same vote with a unique message ID.
+    /// Gossipsub deduplicates by message content, so we need this to vary
+    /// when rebroadcasting to handle message loss. The vote signature remains
+    /// valid regardless of this nonce value.
+    pub broadcast_nonce: u64,
 }
 
 impl ViewChangeVoteGossip {
-    /// Create a new view change vote gossip message.
+    /// Create a new view change vote gossip message with nonce 0.
     pub fn new(vote: ViewChangeVote) -> Self {
-        Self { vote }
+        Self {
+            vote,
+            broadcast_nonce: 0,
+        }
+    }
+
+    /// Create a new view change vote gossip message with a specific nonce.
+    pub fn with_nonce(vote: ViewChangeVote, nonce: u64) -> Self {
+        Self {
+            vote,
+            broadcast_nonce: nonce,
+        }
     }
 
     /// Get the inner view change vote.

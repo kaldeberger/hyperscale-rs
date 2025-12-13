@@ -340,6 +340,7 @@ impl ProductionRunnerBuilder {
 
         // Create network adapter with transaction validation
         // Pass both channels - consensus for BFT messages, transaction for mempool
+        // Thread pools enable non-blocking transaction validation on the crypto pool
         let (network, sync_request_rx, tx_request_rx, cert_request_rx) = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
@@ -348,6 +349,7 @@ impl ProductionRunnerBuilder {
             consensus_tx.clone(),
             transaction_tx.clone(),
             tx_validator.clone(),
+            thread_pools.clone(),
         )
         .await?;
 

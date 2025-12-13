@@ -12,7 +12,9 @@ mod fixtures;
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
 use hyperscale_engine::TransactionValidation;
-use hyperscale_production::{ProductionRunner, RocksDbStorage};
+use hyperscale_production::{
+    ProductionRunner, RocksDbStorage, ThreadPoolConfig, ThreadPoolManager,
+};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
 };
@@ -28,6 +30,11 @@ use tracing::info;
 /// Create a test transaction validator.
 fn test_tx_validator() -> Arc<TransactionValidation> {
     Arc::new(TransactionValidation::new(NetworkDefinition::simulator()))
+}
+
+/// Create a minimal test thread pool manager.
+fn test_thread_pools() -> Arc<ThreadPoolManager> {
+    Arc::new(ThreadPoolManager::new(ThreadPoolConfig::minimal()).unwrap())
 }
 
 /// Test timeout values (from design spec).
@@ -131,6 +138,7 @@ async fn test_network_adapter_starts() {
             consensus_tx,
             transaction_tx,
             test_tx_validator(),
+            test_thread_pools(),
         ),
     )
     .await;
@@ -175,6 +183,7 @@ async fn test_two_node_connection() {
         consensus_tx1,
         transaction_tx1,
         test_tx_validator(),
+        test_thread_pools(),
     )
     .await
     .unwrap();
@@ -204,6 +213,7 @@ async fn test_two_node_connection() {
         consensus_tx2,
         transaction_tx2,
         test_tx_validator(),
+        test_thread_pools(),
     )
     .await
     .unwrap();
@@ -261,6 +271,7 @@ async fn test_topic_subscription() {
         consensus_tx,
         transaction_tx,
         test_tx_validator(),
+        test_thread_pools(),
     )
     .await
     .unwrap();

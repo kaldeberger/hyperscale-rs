@@ -11,6 +11,7 @@ use super::config::Libp2pConfig;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
 use crate::metrics;
+use crate::thread_pools::ThreadPoolManager;
 use futures::StreamExt;
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_engine::TransactionValidation;
@@ -370,6 +371,7 @@ impl Libp2pAdapter {
     /// - sync_request_rx receives inbound sync block requests
     /// - tx_request_rx receives inbound transaction fetch requests
     /// - cert_request_rx receives inbound certificate fetch requests
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Libp2pConfig,
         keypair: identity::Keypair,
@@ -378,6 +380,7 @@ impl Libp2pAdapter {
         consensus_tx: mpsc::Sender<Event>,
         transaction_tx: mpsc::Sender<Event>,
         tx_validator: Arc<TransactionValidation>,
+        thread_pools: Arc<ThreadPoolManager>,
     ) -> Result<
         (
             Arc<Self>,
@@ -510,6 +513,7 @@ impl Libp2pAdapter {
             tx_validator,
             cached_peer_count,
             shard,
+            thread_pools,
         ));
 
         Ok((adapter, sync_request_rx, tx_request_rx, cert_request_rx))
@@ -806,6 +810,7 @@ impl Libp2pAdapter {
         tx_validator: Arc<TransactionValidation>,
         cached_peer_count: Arc<AtomicUsize>,
         local_shard: ShardGroupId,
+        thread_pools: Arc<ThreadPoolManager>,
     ) {
         // Track pending sync requests (outbound)
         let mut pending_requests: HashMap<
@@ -907,6 +912,7 @@ impl Libp2pAdapter {
                         &mut rate_limiter,
                         &tx_validator,
                         local_shard,
+                        &thread_pools,
                     ).await;
 
                     // Update cached peer count after connection changes
@@ -1084,6 +1090,7 @@ impl Libp2pAdapter {
         rate_limiter: &mut SyncRateLimiter,
         tx_validator: &Arc<TransactionValidation>,
         local_shard: ShardGroupId,
+        thread_pools: &ThreadPoolManager,
     ) {
         match event {
             // Handle gossipsub messages
@@ -1153,82 +1160,59 @@ impl Libp2pAdapter {
                     Ok(decoded) => {
                         metrics::record_network_message_received();
 
-                        // For transaction gossips, validate signatures before accepting
-                        // This prevents invalid transactions from entering the mempool
-                        let event_to_send =
-                            if let Event::TransactionGossipReceived { ref tx } = decoded.event {
+                        // Route based on event type:
+                        // - Transactions: dispatch to crypto pool for async validation
+                        // - Consensus messages: send directly to high-priority channel
+                        match decoded.event {
+                            Event::TransactionGossipReceived { tx } => {
+                                // Fire-and-forget: dispatch validation to crypto pool
+                                // This prevents blocking the network loop on signature verification
                                 let validator = tx_validator.clone();
-                                let tx_clone = tx.clone();
-                                let tx_hash = tx.hash();
-
-                                // Run validation on blocking thread pool
-                                let validation_result = tokio::task::spawn_blocking(move || {
-                                    validator.validate_transaction(&tx_clone)
-                                })
-                                .await;
-
-                                match validation_result {
-                                    Ok(Ok(())) => {
-                                        // Validation passed
-                                        Some(decoded.event)
+                                let tx_channel = transaction_tx.clone();
+                                let peer = propagation_source;
+                                thread_pools.spawn_crypto(move || {
+                                    match validator.validate_transaction(&tx) {
+                                        Ok(()) => {
+                                            // Validation passed - send to transaction channel
+                                            let _ = tx_channel.blocking_send(
+                                                Event::TransactionGossipReceived { tx },
+                                            );
+                                        }
+                                        Err(e) => {
+                                            // Validation failed - drop the transaction
+                                            debug!(
+                                                tx_hash = %hex::encode(tx.hash().as_bytes()),
+                                                peer = %peer,
+                                                error = %e,
+                                                "Dropping gossiped transaction with invalid signature"
+                                            );
+                                            metrics::record_invalid_message();
+                                        }
                                     }
-                                    Ok(Err(e)) => {
-                                        // Validation failed - drop the transaction
-                                        debug!(
-                                            tx_hash = %hex::encode(tx_hash.as_bytes()),
-                                            peer = %propagation_source,
-                                            error = %e,
-                                            "Dropping gossiped transaction with invalid signature"
+                                });
+                            }
+                            event => {
+                                // Consensus messages go directly to high-priority channel
+                                // Extract trace context for distributed tracing (when feature enabled)
+                                let send_future = async {
+                                    if consensus_tx.send(event).await.is_err() {
+                                        warn!("Consensus channel closed");
+                                    }
+                                };
+                                #[cfg(feature = "trace-propagation")]
+                                let send_future = {
+                                    let span = tracing::trace_span!("cross_shard_message");
+                                    if let Some(ref trace_ctx) = decoded.trace_context {
+                                        let _ = span.set_parent(trace_ctx.extract());
+                                        tracing::trace!(
+                                            "Extracted trace context from cross-shard message"
                                         );
-                                        metrics::record_invalid_message();
-                                        None
                                     }
-                                    Err(e) => {
-                                        // spawn_blocking task panicked
-                                        warn!(error = ?e, "Transaction validation task panicked");
-                                        None
-                                    }
-                                }
-                            } else {
-                                // Non-transaction messages pass through without validation
-                                Some(decoded.event)
-                            };
+                                    send_future.instrument(span)
+                                };
 
-                        // Send the event if validation passed
-                        // Route to appropriate channel based on event type:
-                        // - Transaction events go to low-priority transaction channel
-                        // - All other events (BFT, execution) go to high-priority consensus channel
-                        if let Some(event) = event_to_send {
-                            let is_transaction_event =
-                                matches!(event, Event::TransactionGossipReceived { .. });
-                            let target_tx = if is_transaction_event {
-                                transaction_tx
-                            } else {
-                                consensus_tx
-                            };
-
-                            // Extract trace context for distributed tracing (when feature enabled)
-                            // We attach the OpenTelemetry context, create a tracing span to capture it,
-                            // then use Future::instrument to attach the span to the send future.
-                            // This ensures the context is active during the async operation.
-                            let send_future = async {
-                                if target_tx.send(event).await.is_err() {
-                                    warn!("Event channel closed");
-                                }
-                            };
-                            #[cfg(feature = "trace-propagation")]
-                            let send_future = {
-                                let span = tracing::trace_span!("cross_shard_message");
-                                if let Some(ref trace_ctx) = decoded.trace_context {
-                                    let _ = span.set_parent(trace_ctx.extract());
-                                    tracing::trace!(
-                                        "Extracted trace context from cross-shard message"
-                                    );
-                                }
-                                send_future.instrument(span)
-                            };
-
-                            send_future.await;
+                                send_future.await;
+                            }
                         }
                     }
                     Err(e) => {

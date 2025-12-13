@@ -23,6 +23,23 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+/// Result of an async block fetch operation.
+#[derive(Debug)]
+pub enum SyncFetchResult {
+    /// Successfully fetched a block.
+    Success {
+        height: u64,
+        peer: PeerId,
+        response_bytes: Vec<u8>,
+    },
+    /// Failed to fetch a block.
+    Failed {
+        height: u64,
+        peer: PeerId,
+        error: String,
+    },
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Sync State Types (for Status API)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -219,7 +236,7 @@ pub fn validate_sync_response(
 ///
 /// The sync manager is responsible for:
 /// 1. Receiving sync requests from BFT (via `SyncNeeded` event)
-/// 2. Fetching blocks from peers using request-response protocol
+/// 2. Fetching blocks from peers using request-response protocol (concurrently)
 /// 3. Validating and ordering received blocks
 /// 4. Delivering verified blocks directly to BFT for commitment
 ///
@@ -254,6 +271,10 @@ pub struct SyncManager {
     peer_shards: HashMap<PeerId, ShardGroupId>,
     /// Our current committed height (updated by state machine).
     committed_height: u64,
+    /// Channel for receiving results from spawned fetch tasks.
+    fetch_result_rx: mpsc::Receiver<SyncFetchResult>,
+    /// Sender for spawned fetch tasks to report results.
+    fetch_result_tx: mpsc::Sender<SyncFetchResult>,
 }
 
 impl SyncManager {
@@ -264,6 +285,10 @@ impl SyncManager {
         event_tx: mpsc::Sender<Event>,
         local_shard: ShardGroupId,
     ) -> Self {
+        // Channel for fetch results - buffer size matches max concurrent fetches
+        let (fetch_result_tx, fetch_result_rx) =
+            mpsc::channel(config.max_concurrent_fetches.max(16));
+
         Self {
             config,
             network,
@@ -278,6 +303,8 @@ impl SyncManager {
             known_peers: Vec::new(),
             peer_shards: HashMap::new(),
             committed_height: 0,
+            fetch_result_rx,
+            fetch_result_tx,
         }
     }
 
@@ -480,22 +507,30 @@ impl SyncManager {
     /// Tick the sync manager - called periodically to drive fetch progress.
     ///
     /// This should be called regularly (e.g., every 100ms) to:
+    /// - Process completed fetch results
     /// - Start new fetch requests (up to max_concurrent_fetches)
     /// - Check for timed out requests
     /// - Retry failed requests
+    ///
+    /// Fetches are spawned as concurrent tasks and results are processed
+    /// via the fetch result channel.
     pub async fn tick(&mut self) {
+        // Always process any pending fetch results, even if not syncing
+        // (we may have outstanding fetches from before sync was cancelled)
+        self.process_fetch_results().await;
+
         if self.sync_target.is_none() {
             return;
         }
 
         // Check for timed out requests
-        self.check_timeouts().await;
+        self.check_timeouts();
 
-        // Start new fetches up to the limit
+        // Spawn new fetches up to the limit (non-blocking)
         while self.pending_fetches.len() < self.config.max_concurrent_fetches {
             if let Some(height) = self.heights_to_fetch.pop_front() {
                 if let Some(peer) = self.select_peer() {
-                    self.start_fetch(height, peer).await;
+                    self.spawn_fetch(height, peer);
                 } else {
                     // No available peers, put height back
                     self.heights_to_fetch.push_front(height);
@@ -505,6 +540,80 @@ impl SyncManager {
                 break;
             }
         }
+    }
+
+    /// Process any completed fetch results from spawned tasks.
+    ///
+    /// This drains the fetch result channel and processes each result,
+    /// delivering blocks to BFT as they become ready.
+    async fn process_fetch_results(&mut self) {
+        // Process all available results without blocking
+        while let Ok(result) = self.fetch_result_rx.try_recv() {
+            match result {
+                SyncFetchResult::Success {
+                    height,
+                    peer,
+                    response_bytes,
+                } => {
+                    self.handle_block_response(height, peer, response_bytes)
+                        .await;
+                }
+                SyncFetchResult::Failed {
+                    height,
+                    peer,
+                    error,
+                } => {
+                    self.on_fetch_failed(height, peer, &error);
+                }
+            }
+        }
+    }
+
+    /// Spawn a fetch request as a background task (non-blocking).
+    ///
+    /// The fetch result will be sent to the fetch_result channel and
+    /// processed in the next tick.
+    fn spawn_fetch(&mut self, height: u64, peer: PeerId) {
+        trace!(height, ?peer, "Spawning concurrent sync fetch");
+
+        // Update peer reputation
+        if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+            rep.in_flight += 1;
+        }
+
+        // Record pending fetch
+        self.pending_fetches.insert(
+            height,
+            PendingFetch {
+                height,
+                peer,
+                started: Instant::now(),
+                retries: 0,
+            },
+        );
+
+        // Clone what we need for the spawned task
+        let network = self.network.clone();
+        let result_tx = self.fetch_result_tx.clone();
+
+        // Spawn the fetch as a background task
+        tokio::spawn(async move {
+            let result = match network.request_block(peer, BlockHeight(height)).await {
+                Ok(response_bytes) => SyncFetchResult::Success {
+                    height,
+                    peer,
+                    response_bytes,
+                },
+                Err(e) => SyncFetchResult::Failed {
+                    height,
+                    peer,
+                    error: format!("network error: {e}"),
+                },
+            };
+
+            // Send result back - ignore error if receiver dropped
+            let _ = result_tx.send(result).await;
+        });
     }
 
     /// Handle a received block response.
@@ -785,39 +894,6 @@ impl SyncManager {
         self.heights_to_fetch.push_back(height);
     }
 
-    /// Start a fetch request for a specific height.
-    async fn start_fetch(&mut self, height: u64, peer: PeerId) {
-        trace!(height, ?peer, "Starting sync fetch");
-
-        // Update peer reputation
-        if let Some(rep) = self.peer_reputations.get_mut(&peer) {
-            rep.in_flight += 1;
-        }
-
-        // Record pending fetch
-        self.pending_fetches.insert(
-            height,
-            PendingFetch {
-                height,
-                peer,
-                started: Instant::now(),
-                retries: 0,
-            },
-        );
-
-        // Send the request and handle the response
-        match self.network.request_block(peer, BlockHeight(height)).await {
-            Ok(response_bytes) => {
-                self.handle_block_response(height, peer, response_bytes)
-                    .await;
-            }
-            Err(e) => {
-                warn!(height, ?peer, error = ?e, "Failed to send sync request");
-                self.on_fetch_failed(height, peer, &format!("network error: {e}"));
-            }
-        }
-    }
-
     /// Handle a block response from a peer.
     ///
     /// Decodes the response, validates the block and QC, and either:
@@ -859,7 +935,7 @@ impl SyncManager {
     }
 
     /// Check for timed out requests.
-    async fn check_timeouts(&mut self) {
+    fn check_timeouts(&mut self) {
         let now = Instant::now();
         let timeout = self.config.initial_timeout;
 

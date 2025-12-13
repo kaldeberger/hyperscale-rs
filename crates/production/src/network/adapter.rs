@@ -1481,7 +1481,7 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = Libp2pConfig::default();
-        assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(config.request_timeout, Duration::from_millis(500));
         assert!(!config.listen_addresses.is_empty());
     }
 }

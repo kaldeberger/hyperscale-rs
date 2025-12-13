@@ -192,6 +192,29 @@ impl MempoolState {
         // Track current height for retry creation
         self.current_height = height;
 
+        // Ensure all committed transactions are in the mempool.
+        // This handles the case where we fetched transactions to vote on a block
+        // but didn't receive them via gossip. We need them in the mempool for
+        // status tracking (deferrals, retries, execution status updates).
+        for tx in &block.transactions {
+            let hash = tx.hash();
+            if !self.pool.contains_key(&hash) {
+                self.pool.insert(
+                    hash,
+                    PoolEntry {
+                        tx: Arc::clone(tx),
+                        status: TransactionStatus::Pending, // Will be updated by execution
+                        added_at: self.now,
+                    },
+                );
+                tracing::debug!(
+                    tx_hash = ?hash,
+                    height = height.0,
+                    "Added committed transaction to mempool"
+                );
+            }
+        }
+
         // Note: We do NOT update transaction status to Committed here.
         // Status updates flow through TransactionStatusChanged events from the
         // execution state machine, which ensures proper ordering when early

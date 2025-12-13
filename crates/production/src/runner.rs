@@ -304,10 +304,14 @@ impl ProductionRunnerBuilder {
             .ok_or_else(|| RunnerError::SendError("network keypair is required".into()))?;
 
         // Separate channels for different event priorities:
+        // - callback_tx/rx: Highest priority - Internal events (crypto/execution callbacks)
+        //   These are results of in-flight work and must be processed immediately to
+        //   unblock consensus progress (e.g., vote signature verified -> can count vote)
         // - consensus_tx/rx: High priority BFT events (votes, proposals, QCs, timers)
         // - transaction_tx/rx: Transaction ingestion (gossip, submissions)
         // - status_tx/rx: Transaction status updates (non-consensus-critical)
         // This prevents transaction floods from starving consensus events
+        let (callback_tx, callback_rx) = mpsc::channel(self.channel_capacity);
         let (consensus_tx, consensus_rx) = mpsc::channel(self.channel_capacity);
         let (transaction_tx, transaction_rx) = mpsc::channel(self.channel_capacity);
         let (status_tx, status_rx) = mpsc::channel(self.channel_capacity);
@@ -396,6 +400,8 @@ impl ProductionRunnerBuilder {
         let executor = Arc::new(RadixExecutor::new(network_definition));
 
         Ok(ProductionRunner {
+            callback_rx,
+            callback_tx,
             consensus_rx,
             consensus_tx,
             transaction_rx,
@@ -441,9 +447,14 @@ impl ProductionRunnerBuilder {
 /// Use [`ProductionRunner::builder()`] to construct a runner with all required
 /// dependencies.
 pub struct ProductionRunner {
-    /// Receives high-priority consensus events (BFT, timers, internal callbacks).
+    /// Receives highest-priority callback events (crypto verification, execution results).
+    /// These are Internal priority events that unblock in-flight consensus work.
+    callback_rx: mpsc::Receiver<Event>,
+    /// Clone this to send callback events from crypto/execution thread pools.
+    callback_tx: mpsc::Sender<Event>,
+    /// Receives high-priority consensus events (BFT network messages, timers).
     consensus_rx: mpsc::Receiver<Event>,
-    /// Clone this to send consensus events from timers, verification callbacks, etc.
+    /// Clone this to send consensus events from timers, network, etc.
     consensus_tx: mpsc::Sender<Event>,
     /// Receives low-priority transaction events (submissions, gossip).
     transaction_rx: mpsc::Receiver<Event>,
@@ -694,9 +705,16 @@ impl ProductionRunner {
         let mut consensus_batch_count: usize = 0;
 
         loop {
-            // Use biased select for priority: consensus events are always checked first.
-            // After CONSENSUS_BATCH_SIZE events, we yield to lower-priority work.
-            // Transaction events are processed only when consensus channel is empty.
+            // Use biased select for priority ordering:
+            // 1. Shutdown (always first)
+            // 2. Callbacks (Internal priority - crypto/execution results that unblock consensus)
+            // 3. Consensus (Network/Timer priority - BFT messages, timers)
+            // 4. Transaction fetch requests (needed for active consensus)
+            // 5. Certificate fetch requests (needed for active consensus)
+            // 6. Transactions (Client priority - submissions, gossip)
+            // 7. Sync requests (background)
+            // 8. Status events (non-critical)
+            // 9. Ticks (periodic maintenance)
             tokio::select! {
                 biased;
 
@@ -706,7 +724,39 @@ impl ProductionRunner {
                     break;
                 }
 
-                // HIGH PRIORITY: Handle incoming consensus events (BFT, timers, internal)
+                // HIGHEST PRIORITY: Callback events (Internal priority)
+                // These are results from crypto verification and execution that unblock
+                // in-flight consensus work. Process ALL available callbacks before
+                // checking other channels to ensure consensus makes progress.
+                Some(event) = self.callback_rx.recv() => {
+                    let event_type = event.type_name();
+                    let event_span = span!(
+                        Level::DEBUG,
+                        "handle_callback",
+                        event.type = %event_type,
+                        node = self.state.node_index(),
+                        shard = ?self.state.shard(),
+                    );
+                    let _event_guard = event_span.enter();
+
+                    // Update time
+                    let now = self.start_time.elapsed();
+                    self.state.set_time(now);
+
+                    // Process callback event - these go directly to state machine
+                    let actions = self.state.handle(event);
+
+                    for action in actions {
+                        if let Err(e) = self.process_action(action).await {
+                            tracing::error!(error = ?e, "Error processing action from callback");
+                        }
+                    }
+
+                    // Don't reset batch counter - callbacks don't count toward the limit
+                    // as they're completing in-flight work, not adding new work
+                }
+
+                // HIGH PRIORITY: Handle incoming consensus events (BFT network messages, timers)
                 // Only check this branch if we haven't hit the batch limit
                 event = self.consensus_rx.recv(), if consensus_batch_count < CONSENSUS_BATCH_SIZE => {
                     match event {
@@ -1091,7 +1141,7 @@ impl ProductionRunner {
                 public_key,
                 signing_message,
             } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Verify vote signature against domain-separated message
@@ -1110,7 +1160,7 @@ impl ProductionRunner {
                 provision,
                 public_key,
             } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message (must match ExecutionState::sign_provision)
@@ -1129,7 +1179,7 @@ impl ProductionRunner {
             }
 
             Action::VerifyStateVoteSignature { vote, public_key } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message (must match ExecutionState::create_vote)
@@ -1151,7 +1201,7 @@ impl ProductionRunner {
                 certificate,
                 public_keys,
             } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message - StateCertificates aggregate signatures
@@ -1198,7 +1248,7 @@ impl ProductionRunner {
                 block_hash,
                 signing_message,
             } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Get signer keys based on QC's signer bitfield
@@ -1243,7 +1293,7 @@ impl ProductionRunner {
                 transactions,
                 state_root: _,
             } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
 
@@ -1291,7 +1341,7 @@ impl ProductionRunner {
                 transaction,
                 provisions,
             } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
                 let topology = self.topology.clone();
@@ -1349,7 +1399,7 @@ impl ProductionRunner {
             // Merkle computation on execution pool (can be parallelized internally)
             // Note: This action is currently not emitted by any state machine.
             Action::ComputeMerkleRoot { tx_hash, writes } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
 
                 self.thread_pools.spawn_execution(move || {
                     // Simple merkle root computation using hash chain
@@ -1375,7 +1425,8 @@ impl ProductionRunner {
 
             // Internal events are routed based on criticality:
             // - Status events (TransactionStatusChanged, TransactionExecuted) go to status channel
-            // - All other internal events (QC formed, block committed, etc.) go to consensus channel
+            // - All other internal events (QC formed, block committed, etc.) go to callback channel
+            //   for highest priority processing
             Action::EnqueueInternal { event } => {
                 let is_status_event = matches!(
                     &event,
@@ -1389,8 +1440,10 @@ impl ProductionRunner {
                         .await
                         .map_err(|e| RunnerError::SendError(e.to_string()))?;
                 } else {
-                    // Consensus-critical: route to consensus channel
-                    self.consensus_tx
+                    // Consensus-critical internal event: route to callback channel
+                    // This ensures internal events (QC formed, block ready, etc.) are
+                    // processed before new network events
+                    self.callback_tx
                         .send(event)
                         .await
                         .map_err(|e| RunnerError::SendError(e.to_string()))?;
@@ -1502,9 +1555,10 @@ impl ProductionRunner {
 
             // ═══════════════════════════════════════════════════════════════════════
             // Storage reads - RocksDB is internally thread-safe, no lock needed
+            // Results go to callback channel as they unblock consensus progress
             // ═══════════════════════════════════════════════════════════════════════
             Action::FetchStateEntries { tx_hash, nodes } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
 
@@ -1515,7 +1569,7 @@ impl ProductionRunner {
             }
 
             Action::FetchBlock { height } => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
 
                 tokio::task::spawn_blocking(move || {
@@ -1525,7 +1579,7 @@ impl ProductionRunner {
             }
 
             Action::FetchChainMetadata => {
-                let event_tx = self.consensus_tx.clone();
+                let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
 
                 tokio::task::spawn_blocking(move || {
@@ -1625,7 +1679,7 @@ impl ProductionRunner {
             return;
         }
 
-        let event_tx = self.consensus_tx.clone();
+        let event_tx = self.callback_tx.clone();
         let batch_size = pending.total_count();
 
         self.thread_pools.spawn_crypto(move || {

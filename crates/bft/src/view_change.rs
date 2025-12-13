@@ -761,10 +761,10 @@ impl ViewChangeState {
             "Applied coordinated view change"
         );
 
-        // Clean up old votes
-        self.cleanup_old_votes(height);
-
-        // Build and broadcast certificate
+        // Build and broadcast certificate BEFORE cleanup.
+        // We must build the certificate before cleaning up votes because cleanup_old_votes
+        // removes votes for round <= current_round, and we just set current_round = new_round.
+        // If we clean up first, the votes for new_round would be deleted before we can use them.
         let mut actions = vec![];
         let highest_qc = if let Some(cert) = self.build_certificate(BlockHeight(height), new_round)
         {
@@ -782,6 +782,9 @@ impl ViewChangeState {
                 .cloned()
                 .unwrap_or_else(QuorumCertificate::genesis)
         };
+
+        // Clean up old votes AFTER building the certificate
+        self.cleanup_old_votes(height);
 
         // Emit internal event for BFT state to react to
         actions.push(Action::EnqueueInternal {

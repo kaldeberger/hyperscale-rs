@@ -204,7 +204,7 @@ fn default_max_message_size() -> usize {
 }
 
 fn default_gossipsub_heartbeat_ms() -> u64 {
-    1000
+    100
 }
 
 /// Consensus configuration.

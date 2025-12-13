@@ -48,7 +48,7 @@ request_timeout_ms = 30000
 max_message_size = 65536
 
 # Gossipsub heartbeat interval (milliseconds)
-gossipsub_heartbeat_ms = 1000
+gossipsub_heartbeat_ms = 100
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Consensus Configuration

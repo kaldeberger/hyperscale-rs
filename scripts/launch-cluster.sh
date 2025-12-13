@@ -203,7 +203,7 @@ listen_addr = "/ip4/0.0.0.0/udp/$p2p_port/quic-v1"
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 request_timeout_ms = 30000
 max_message_size = 10485760
-gossipsub_heartbeat_ms = 1000
+gossipsub_heartbeat_ms = 100
 
 [consensus]
 proposal_interval_ms = 300

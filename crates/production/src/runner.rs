@@ -709,23 +709,24 @@ impl ProductionRunner {
                             self.state.set_time(now);
 
                             // Check for SyncNeeded - handle specially
-                            let sync_target = if let Event::SyncNeeded { target_height, target_hash } = &event {
-                                Some((*target_height, *target_hash))
-                            } else {
-                                None
-                            };
+                            // The runner handles this directly (sync manager), not the state machine.
+                            if let Event::SyncNeeded { target_height, target_hash } = event {
+                                self.sync_manager.start_sync(target_height, target_hash);
+                                continue;
+                            }
 
                             // Check for TransactionFetchNeeded - handle specially
-                            let tx_fetch_info = if let Event::TransactionFetchNeeded {
+                            // The runner handles this directly (network fetch), not the state machine.
+                            // If we passed it to state.handle(), it would re-enqueue itself infinitely.
+                            if let Event::TransactionFetchNeeded {
                                 block_hash,
                                 proposer,
                                 missing_tx_hashes,
-                            } = &event
+                            } = event
                             {
-                                Some((*block_hash, *proposer, missing_tx_hashes.clone()))
-                            } else {
-                                None
-                            };
+                                self.handle_transaction_fetch_needed(block_hash, proposer, missing_tx_hashes).await;
+                                continue;
+                            }
 
                             // Process event synchronously (fast)
                             let actions = {
@@ -805,16 +806,6 @@ impl ProductionRunner {
 
                             // Dispatch collected verifications as batches
                             self.dispatch_batched_verifications(pending);
-
-                            // If this was a sync request, start the sync manager
-                            if let Some((target_height, target_hash)) = sync_target {
-                                self.sync_manager.start_sync(target_height, target_hash);
-                            }
-
-                            // If this was a transaction fetch request, fetch from proposer
-                            if let Some((block_hash, proposer, missing_tx_hashes)) = tx_fetch_info {
-                                self.handle_transaction_fetch_needed(block_hash, proposer, missing_tx_hashes).await;
-                            }
                         }
                         None => {
                             // Channel closed, exit loop

@@ -314,7 +314,7 @@ impl ProductionRunnerBuilder {
         // - status_tx/rx: Transaction status updates (non-consensus-critical)
         // This prevents transaction floods from starving consensus events
         let (timer_tx, timer_rx) = mpsc::channel(16); // Small channel, just for timers
-        let (callback_tx, callback_rx) = mpsc::channel(self.channel_capacity);
+        let (callback_tx, callback_rx) = mpsc::unbounded_channel(); // Unbounded - thread pools must never block
         let (consensus_tx, consensus_rx) = mpsc::channel(self.channel_capacity);
         let (transaction_tx, transaction_rx) = mpsc::channel(self.channel_capacity);
         let (status_tx, status_rx) = mpsc::channel(self.channel_capacity);
@@ -473,9 +473,11 @@ pub struct ProductionRunner {
     timer_rx: mpsc::Receiver<Event>,
     /// Receives highest-priority callback events (crypto verification, execution results).
     /// These are Internal priority events that unblock in-flight consensus work.
-    callback_rx: mpsc::Receiver<Event>,
+    /// Unbounded channel ensures thread pools never block waiting to send results.
+    callback_rx: mpsc::UnboundedReceiver<Event>,
     /// Clone this to send callback events from crypto/execution thread pools.
-    callback_tx: mpsc::Sender<Event>,
+    /// Unbounded to prevent thread pool deadlocks - backpressure should be at work dispatch, not result return.
+    callback_tx: mpsc::UnboundedSender<Event>,
     /// Receives high-priority consensus events (BFT network messages).
     consensus_rx: mpsc::Receiver<Event>,
     /// Clone this to send consensus events from network.
@@ -1176,7 +1178,7 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx.blocking_send(Event::VoteSignatureVerified { vote, valid });
+                    let _ = event_tx.send(Event::VoteSignatureVerified { vote, valid });
                 });
             }
 
@@ -1197,8 +1199,7 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx
-                        .blocking_send(Event::ProvisionSignatureVerified { provision, valid });
+                    let _ = event_tx.send(Event::ProvisionSignatureVerified { provision, valid });
                 });
             }
 
@@ -1216,8 +1217,7 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ =
-                        event_tx.blocking_send(Event::StateVoteSignatureVerified { vote, valid });
+                    let _ = event_tx.send(Event::StateVoteSignatureVerified { vote, valid });
                 });
             }
 
@@ -1259,10 +1259,8 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx.blocking_send(Event::StateCertificateSignatureVerified {
-                        certificate,
-                        valid,
-                    });
+                    let _ = event_tx
+                        .send(Event::StateCertificateSignatureVerified { certificate, valid });
                 });
             }
 
@@ -1302,8 +1300,7 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ =
-                        event_tx.blocking_send(Event::QcSignatureVerified { block_hash, valid });
+                    let _ = event_tx.send(Event::QcSignatureVerified { block_hash, valid });
                 });
             }
 
@@ -1350,7 +1347,7 @@ impl ProductionRunner {
                         }
                     };
 
-                    let _ = event_tx.blocking_send(Event::TransactionsExecuted {
+                    let _ = event_tx.send(Event::TransactionsExecuted {
                         block_hash,
                         results,
                     });
@@ -1415,8 +1412,7 @@ impl ProductionRunner {
                         }
                     };
 
-                    let _ = event_tx
-                        .blocking_send(Event::CrossShardTransactionExecuted { tx_hash, result });
+                    let _ = event_tx.send(Event::CrossShardTransactionExecuted { tx_hash, result });
                 });
             }
 
@@ -1443,7 +1439,7 @@ impl ProductionRunner {
                         }
                         hyperscale_types::Hash::from_bytes(&data)
                     };
-                    let _ = event_tx.blocking_send(Event::MerkleRootComputed { tx_hash, root });
+                    let _ = event_tx.send(Event::MerkleRootComputed { tx_hash, root });
                 });
             }
 
@@ -1469,7 +1465,6 @@ impl ProductionRunner {
                     // processed before new network events
                     self.callback_tx
                         .send(event)
-                        .await
                         .map_err(|e| RunnerError::SendError(e.to_string()))?;
                 }
             }
@@ -1588,7 +1583,7 @@ impl ProductionRunner {
 
                 tokio::task::spawn_blocking(move || {
                     let entries = executor.fetch_state_entries(&*storage, &nodes);
-                    let _ = event_tx.blocking_send(Event::StateEntriesFetched { tx_hash, entries });
+                    let _ = event_tx.send(Event::StateEntriesFetched { tx_hash, entries });
                 });
             }
 
@@ -1598,7 +1593,7 @@ impl ProductionRunner {
 
                 tokio::task::spawn_blocking(move || {
                     let block = storage.get_block(height).map(|(b, _qc)| b);
-                    let _ = event_tx.blocking_send(Event::BlockFetched { height, block });
+                    let _ = event_tx.send(Event::BlockFetched { height, block });
                 });
             }
 
@@ -1608,8 +1603,7 @@ impl ProductionRunner {
 
                 tokio::task::spawn_blocking(move || {
                     let (height, hash, qc) = storage.get_chain_metadata();
-                    let _ =
-                        event_tx.blocking_send(Event::ChainMetadataFetched { height, hash, qc });
+                    let _ = event_tx.send(Event::ChainMetadataFetched { height, hash, qc });
                 });
             }
 
@@ -1770,8 +1764,8 @@ impl ProductionRunner {
 
                     if batch_valid {
                         for (vote, _, _) in ed25519_votes {
-                            let _ = event_tx
-                                .blocking_send(Event::VoteSignatureVerified { vote, valid: true });
+                            let _ =
+                                event_tx.send(Event::VoteSignatureVerified { vote, valid: true });
                         }
                     } else {
                         // Fallback to individual verification to find which ones failed
@@ -1780,8 +1774,7 @@ impl ProductionRunner {
                             if !valid {
                                 crate::metrics::record_signature_verification_failure();
                             }
-                            let _ = event_tx
-                                .blocking_send(Event::VoteSignatureVerified { vote, valid });
+                            let _ = event_tx.send(Event::VoteSignatureVerified { vote, valid });
                         }
                     }
                 }
@@ -1792,7 +1785,7 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx.blocking_send(Event::VoteSignatureVerified { vote, valid });
+                    let _ = event_tx.send(Event::VoteSignatureVerified { vote, valid });
                 }
             }
 
@@ -1841,10 +1834,8 @@ impl ProductionRunner {
 
                     if batch_valid {
                         for (vote, _, _) in ed25519_votes {
-                            let _ = event_tx.blocking_send(Event::StateVoteSignatureVerified {
-                                vote,
-                                valid: true,
-                            });
+                            let _ = event_tx
+                                .send(Event::StateVoteSignatureVerified { vote, valid: true });
                         }
                     } else {
                         for (vote, pk, msg) in ed25519_votes {
@@ -1852,8 +1843,8 @@ impl ProductionRunner {
                             if !valid {
                                 crate::metrics::record_signature_verification_failure();
                             }
-                            let _ = event_tx
-                                .blocking_send(Event::StateVoteSignatureVerified { vote, valid });
+                            let _ =
+                                event_tx.send(Event::StateVoteSignatureVerified { vote, valid });
                         }
                     }
                 }
@@ -1864,8 +1855,7 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ =
-                        event_tx.blocking_send(Event::StateVoteSignatureVerified { vote, valid });
+                    let _ = event_tx.send(Event::StateVoteSignatureVerified { vote, valid });
                 }
             }
 

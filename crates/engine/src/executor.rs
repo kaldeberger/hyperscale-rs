@@ -77,6 +77,8 @@ pub struct RadixExecutor {
     vm_modules: DefaultVmModules,
     /// Cached execution config
     exec_config: ExecutionConfig,
+    /// Cached transaction validator to avoid recreating per transaction
+    validator: TransactionValidator,
 }
 
 impl RadixExecutor {
@@ -87,10 +89,12 @@ impl RadixExecutor {
     pub fn new(network: NetworkDefinition) -> Self {
         let vm_modules = DefaultVmModules::default();
         let exec_config = ExecutionConfig::for_notarized_transaction(network.clone());
+        let validator = TransactionValidator::new_with_latest_config(&network);
         Self {
             network,
             vm_modules,
             exec_config,
+            validator,
         }
     }
 
@@ -200,14 +204,12 @@ impl RadixExecutor {
         // Take a snapshot for isolated execution
         let snapshot = storage.snapshot();
 
-        // Validate and execute
-        let validator = TransactionValidator::new_with_latest_config(&self.network);
-        let user_tx = tx.transaction();
-
-        let validated = user_tx
-            .prepare_and_validate(&validator)
-            .map_err(|e| ExecutionError::Preparation(format!("Validation failed: {:?}", e)))?;
-        let executable = validated.create_executable();
+        // Get or create validated transaction (cached on RoutableTransaction)
+        // This avoids re-validating signatures if already validated at RPC submission
+        let validated = tx
+            .get_or_validate(&self.validator)
+            .ok_or_else(|| ExecutionError::Preparation("Validation failed".to_string()))?;
+        let executable = validated.clone().create_executable();
 
         // Use cached vm_modules and exec_config
         let receipt = execute_transaction(

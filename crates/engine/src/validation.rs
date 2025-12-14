@@ -73,12 +73,15 @@ impl From<TransactionValidationError> for ValidationError {
 #[derive(Clone)]
 pub struct TransactionValidation {
     network: NetworkDefinition,
+    /// Cached Radix transaction validator
+    validator: TransactionValidator,
 }
 
 impl TransactionValidation {
     /// Create a new transaction validator for the given network.
     pub fn new(network: NetworkDefinition) -> Self {
-        Self { network }
+        let validator = TransactionValidator::new_with_latest_config(&network);
+        Self { network, validator }
     }
 
     /// Validate a transaction's signatures synchronously.
@@ -98,12 +101,9 @@ impl TransactionValidation {
     /// Signature verification is CPU-intensive. In production, this should
     /// be called on the crypto thread pool, not the main event loop.
     pub fn validate_transaction(&self, tx: &RoutableTransaction) -> Result<(), ValidationError> {
-        let validator = TransactionValidator::new_with_latest_config(&self.network);
-        let user_tx = tx.transaction();
-
-        user_tx
-            .prepare_and_validate(&validator)
-            .map_err(|e| ValidationError::PreparationFailed(format!("{:?}", e)))?;
+        // Use cached validation if available, otherwise validate and cache
+        tx.get_or_validate(&self.validator)
+            .ok_or_else(|| ValidationError::PreparationFailed("Validation failed".to_string()))?;
 
         Ok(())
     }

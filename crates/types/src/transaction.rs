@@ -2,14 +2,15 @@
 
 use crate::{BlockHeight, Hash, NodeId, ShardGroupId, StateCertificate, SubstateWrite};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
-use radix_transactions::model::UserTransaction;
+use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
+use radix_transactions::validation::TransactionValidator;
 use sbor::prelude::*;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 /// A transaction with routing information.
 ///
 /// Wraps a Radix `UserTransaction` with routing metadata for sharding.
-#[derive(Debug, Clone)]
 pub struct RoutableTransaction {
     /// The underlying Radix transaction.
     transaction: UserTransaction,
@@ -28,6 +29,12 @@ pub struct RoutableTransaction {
 
     /// Cached hash (computed on first access).
     hash: Hash,
+
+    /// Cached validated transaction (computed on first validation).
+    /// This avoids re-validating signatures during execution.
+    /// Not serialized - reconstructed on demand.
+    /// Option because validation can theoretically fail (though shouldn't for RPC-validated txs).
+    validated: OnceLock<Option<ValidatedUserTransaction>>,
 }
 
 // Manual PartialEq/Eq - compare by hash for efficiency
@@ -38,6 +45,32 @@ impl PartialEq for RoutableTransaction {
 }
 
 impl Eq for RoutableTransaction {}
+
+// Manual Clone - OnceLock doesn't implement Clone, and we don't want to clone the cached value
+impl Clone for RoutableTransaction {
+    fn clone(&self) -> Self {
+        Self {
+            transaction: self.transaction.clone(),
+            declared_reads: self.declared_reads.clone(),
+            declared_writes: self.declared_writes.clone(),
+            retry_details: self.retry_details.clone(),
+            hash: self.hash,
+            validated: OnceLock::new(), // Don't clone cache - will be recomputed if needed
+        }
+    }
+}
+
+// Manual Debug - skip the validated field
+impl std::fmt::Debug for RoutableTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutableTransaction")
+            .field("hash", &self.hash)
+            .field("declared_reads", &self.declared_reads)
+            .field("declared_writes", &self.declared_writes)
+            .field("retry_details", &self.retry_details)
+            .finish_non_exhaustive()
+    }
+}
 
 impl RoutableTransaction {
     /// Create a new routable transaction from a UserTransaction.
@@ -75,6 +108,7 @@ impl RoutableTransaction {
             declared_writes,
             retry_details,
             hash,
+            validated: OnceLock::new(),
         }
     }
 
@@ -91,6 +125,32 @@ impl RoutableTransaction {
     /// Consume self and return the underlying transaction.
     pub fn into_transaction(self) -> UserTransaction {
         self.transaction
+    }
+
+    /// Get or create a validated transaction.
+    ///
+    /// The first call validates the transaction and caches the result.
+    /// Subsequent calls return the cached value, avoiding re-validation.
+    ///
+    /// Returns None if validation fails (should not happen for transactions
+    /// that passed RPC validation).
+    pub fn get_or_validate(
+        &self,
+        validator: &TransactionValidator,
+    ) -> Option<&ValidatedUserTransaction> {
+        self.validated
+            .get_or_init(|| {
+                self.transaction
+                    .clone()
+                    .prepare_and_validate(validator)
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// Check if this transaction has already been validated and cached.
+    pub fn is_validated(&self) -> bool {
+        self.validated.get().is_some()
     }
 
     /// Get the transaction as SBOR-encoded bytes.
@@ -243,6 +303,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             declared_reads,
             declared_writes,
             retry_details,
+            validated: OnceLock::new(),
         })
     }
 }

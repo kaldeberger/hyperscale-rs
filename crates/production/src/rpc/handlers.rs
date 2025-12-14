@@ -94,7 +94,8 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
         version: env!("CARGO_PKG_VERSION").to_string(),
         mempool: MempoolStatusResponse {
             pending_count: mempool_snapshot.pending_count,
-            executing_count: mempool_snapshot.executing_count,
+            committed_count: mempool_snapshot.committed_count,
+            executed_count: mempool_snapshot.executed_count,
             total_count: mempool_snapshot.total_count,
             blocked_count: mempool_snapshot.blocked_count,
         },
@@ -368,7 +369,8 @@ pub async fn mempool_handler(State(state): State<RpcState>) -> impl IntoResponse
     let snapshot = state.mempool_snapshot.read().await;
     Json(MempoolStatusResponse {
         pending_count: snapshot.pending_count,
-        executing_count: snapshot.executing_count,
+        committed_count: snapshot.committed_count,
+        executed_count: snapshot.executed_count,
         total_count: snapshot.total_count,
         blocked_count: snapshot.blocked_count,
     })
@@ -676,7 +678,8 @@ mod tests {
         {
             let mut snapshot = state.mempool_snapshot.write().await;
             snapshot.pending_count = 10;
-            snapshot.executing_count = 5;
+            snapshot.committed_count = 3;
+            snapshot.executed_count = 2;
             snapshot.blocked_count = 2;
             snapshot.total_count = 17;
         }
@@ -704,7 +707,8 @@ mod tests {
         let resp: MempoolStatusResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(resp.pending_count, 10);
-        assert_eq!(resp.executing_count, 5);
+        assert_eq!(resp.committed_count, 3);
+        assert_eq!(resp.executed_count, 2);
         assert_eq!(resp.blocked_count, 2);
         assert_eq!(resp.total_count, 17);
     }

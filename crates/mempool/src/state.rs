@@ -21,9 +21,10 @@ pub struct LockContentionStats {
     pub pending_count: u64,
     /// Number of pending transactions that conflict with locked nodes.
     pub pending_blocked: u64,
-    /// Number of transactions currently executing (holding state locks).
-    /// This includes transactions in Committed or Executed status.
-    pub executing_count: u64,
+    /// Number of transactions in Committed status (block committed, being executed).
+    pub committed_count: u64,
+    /// Number of transactions in Executed status (execution done, awaiting certificate).
+    pub executed_count: u64,
 }
 
 impl LockContentionStats {
@@ -795,33 +796,44 @@ impl MempoolState {
     /// - `blocked_count`: Number of transactions blocked waiting for a winner
     /// - `pending_count`: Number of transactions in Pending status
     /// - `pending_blocked`: Number of pending transactions that conflict with locked nodes
-    /// - `executing_count`: Number of transactions holding state locks (Committed or Executed)
+    /// - `committed_count`: Number of transactions in Committed status
+    /// - `executed_count`: Number of transactions in Executed status
     pub fn lock_contention_stats(&self) -> LockContentionStats {
         let locked = self.locked_nodes();
         let locked_nodes = locked.len() as u64;
         let blocked_count = self.blocked_by.len() as u64;
 
-        // Single pass over pool to count pending and executing transactions
-        let (pending_count, pending_blocked, executing_count) = self.pool.values().fold(
-            (0u64, 0u64, 0u64),
-            |(pending, pending_blocked, executing), e| {
-                if e.status == TransactionStatus::Pending {
-                    let is_blocked = self.conflicts_with_locked(&e.tx, &locked);
-                    (pending + 1, pending_blocked + is_blocked as u64, executing)
-                } else if e.status.holds_state_lock() {
-                    (pending, pending_blocked, executing + 1)
-                } else {
-                    (pending, pending_blocked, executing)
-                }
-            },
-        );
+        // Single pass over pool to count transactions by status
+        let (pending_count, pending_blocked, committed_count, executed_count) =
+            self.pool.values().fold(
+                (0u64, 0u64, 0u64, 0u64),
+                |(pending, pending_blocked, committed, executed), e| match &e.status {
+                    TransactionStatus::Pending => {
+                        let is_blocked = self.conflicts_with_locked(&e.tx, &locked);
+                        (
+                            pending + 1,
+                            pending_blocked + is_blocked as u64,
+                            committed,
+                            executed,
+                        )
+                    }
+                    TransactionStatus::Committed(_) => {
+                        (pending, pending_blocked, committed + 1, executed)
+                    }
+                    TransactionStatus::Executed(_) => {
+                        (pending, pending_blocked, committed, executed + 1)
+                    }
+                    _ => (pending, pending_blocked, committed, executed),
+                },
+            );
 
         LockContentionStats {
             locked_nodes,
             blocked_count,
             pending_count,
             pending_blocked,
-            executing_count,
+            committed_count,
+            executed_count,
         }
     }
 

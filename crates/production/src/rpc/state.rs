@@ -148,8 +148,10 @@ impl TransactionStatusCache {
 pub struct MempoolSnapshot {
     /// Number of pending transactions (waiting to be included in a block).
     pub pending_count: usize,
-    /// Number of transactions currently being executed (holding locks).
-    pub executing_count: usize,
+    /// Number of transactions in Committed status (block committed, being executed).
+    pub committed_count: usize,
+    /// Number of transactions in Executed status (execution done, awaiting certificate).
+    pub executed_count: usize,
     /// Total number of transactions in the mempool.
     pub total_count: usize,
     /// Number of transactions blocked waiting for a winner.

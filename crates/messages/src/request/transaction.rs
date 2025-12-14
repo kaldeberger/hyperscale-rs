@@ -85,8 +85,8 @@ mod tests {
             "TX request bytes (first 15): {:?}",
             &bytes[..15.min(bytes.len())]
         );
-        for i in 0..10 {
-            println!("byte[{}] = {:#04x} ({})", i, bytes[i], bytes[i]);
+        for (i, byte) in bytes.iter().enumerate().take(10) {
+            println!("byte[{}] = {:#04x} ({})", i, byte, byte);
         }
 
         // Find the fetch_type value (should be 0 for transactions)

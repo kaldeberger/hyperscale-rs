@@ -166,10 +166,12 @@ pub enum FetchResult {
 #[derive(Debug)]
 struct PendingFetchRequest {
     /// The peer we're fetching from.
+    #[allow(dead_code)]
     peer: PeerId,
     /// When the request was sent.
     started: Instant,
     /// Current retry count for this peer.
+    #[allow(dead_code)]
     retries: u32,
 }
 
@@ -177,8 +179,10 @@ struct PendingFetchRequest {
 #[derive(Debug)]
 struct BlockFetchState {
     /// The block hash.
+    #[allow(dead_code)]
     block_hash: Hash,
     /// The type of fetch (transaction or certificate).
+    #[allow(dead_code)]
     kind: FetchKind,
     /// The original proposer (preferred peer).
     proposer: ValidatorId,
@@ -356,9 +360,7 @@ impl FetchManager {
     /// Called during initialization to build the peer map for fallback selection.
     pub fn register_committee_member(&mut self, validator_id: ValidatorId, peer_id: PeerId) {
         self.committee_peers.insert(validator_id, peer_id);
-        self.peer_reputations
-            .entry(peer_id)
-            .or_insert_with(FetchPeerReputation::default);
+        self.peer_reputations.entry(peer_id).or_default();
         debug!(
             validator_id = validator_id.0,
             ?peer_id,

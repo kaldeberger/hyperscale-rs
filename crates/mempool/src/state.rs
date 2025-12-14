@@ -1326,7 +1326,7 @@ mod tests {
             mempool
                 .blocked_losers_by_winner
                 .get(&winner_hash)
-                .map_or(false, |losers| losers.contains(&loser_hash)),
+                .is_some_and(|losers| losers.contains(&loser_hash)),
             "Reverse index should contain loser"
         );
 

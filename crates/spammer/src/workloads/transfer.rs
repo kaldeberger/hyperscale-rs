@@ -206,6 +206,104 @@ impl TransferWorkload {
             self.generate_same_shard_inner(accounts, rng)
         }
     }
+
+    /// Generate a same-shard transfer for a specific shard.
+    fn generate_same_shard_for<R: Rng + ?Sized>(
+        &self,
+        accounts: &AccountPool,
+        target_shard: ShardGroupId,
+        rng: &mut R,
+    ) -> Option<RoutableTransaction> {
+        let shard_accounts = accounts.accounts_for_shard(target_shard)?;
+
+        if shard_accounts.len() < 2 {
+            return None;
+        }
+
+        let (idx1, idx2) = self.select_pair_indices(shard_accounts.len(), rng);
+        let from = &shard_accounts[idx1];
+        let to = &shard_accounts[idx2];
+
+        self.build_transfer(from, to)
+    }
+
+    /// Generate a cross-shard transfer that involves a specific shard.
+    ///
+    /// The transaction will have the target shard as one of the involved shards.
+    fn generate_cross_shard_for<R: Rng + ?Sized>(
+        &self,
+        accounts: &AccountPool,
+        target_shard: ShardGroupId,
+        rng: &mut R,
+    ) -> Option<RoutableTransaction> {
+        if accounts.num_shards() < 2 {
+            return None;
+        }
+
+        // Pick another shard randomly (different from target)
+        let mut other_shard = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
+        while other_shard == target_shard {
+            other_shard = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
+        }
+
+        let target_accounts = accounts.accounts_for_shard(target_shard)?;
+        let other_accounts = accounts.accounts_for_shard(other_shard)?;
+
+        if target_accounts.is_empty() || other_accounts.is_empty() {
+            return None;
+        }
+
+        // Randomly decide if target shard is sender or receiver
+        let target_is_sender = rng.gen_bool(0.5);
+
+        let (from, to) = if target_is_sender {
+            let idx1 = self.select_single_index(target_accounts.len(), rng);
+            let idx2 = self.select_single_index(other_accounts.len(), rng);
+            (&target_accounts[idx1], &other_accounts[idx2])
+        } else {
+            let idx1 = self.select_single_index(other_accounts.len(), rng);
+            let idx2 = self.select_single_index(target_accounts.len(), rng);
+            (&other_accounts[idx1], &target_accounts[idx2])
+        };
+
+        self.build_transfer(from, to)
+    }
+
+    /// Generate a transaction that involves a specific shard.
+    ///
+    /// This generates either a same-shard transaction within the target shard,
+    /// or a cross-shard transaction where the target shard is one of the involved shards.
+    pub fn generate_for_shard<R: Rng + ?Sized>(
+        &self,
+        accounts: &AccountPool,
+        target_shard: ShardGroupId,
+        rng: &mut R,
+    ) -> Option<RoutableTransaction> {
+        let is_cross_shard =
+            accounts.num_shards() >= 2 && rng.gen::<f64>() < self.cross_shard_ratio;
+
+        if is_cross_shard {
+            self.generate_cross_shard_for(accounts, target_shard, rng)
+        } else {
+            self.generate_same_shard_for(accounts, target_shard, rng)
+        }
+    }
+
+    /// Generate a batch of transactions for a specific shard.
+    ///
+    /// All transactions will involve the target shard (either as the only shard
+    /// for same-shard transactions, or as one of the involved shards for cross-shard).
+    pub fn generate_batch_for_shard<R: Rng + ?Sized>(
+        &self,
+        accounts: &AccountPool,
+        target_shard: ShardGroupId,
+        count: usize,
+        rng: &mut R,
+    ) -> Vec<RoutableTransaction> {
+        (0..count)
+            .filter_map(|_| self.generate_for_shard(accounts, target_shard, rng))
+            .collect()
+    }
 }
 
 impl WorkloadGenerator for TransferWorkload {
@@ -233,6 +331,7 @@ impl WorkloadGenerator for TransferWorkload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_types::shard_for_node;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -268,5 +367,95 @@ mod tests {
             tx.is_cross_shard(2),
             "Transaction should be cross-shard for 2 shards"
         );
+    }
+
+    #[test]
+    fn test_generate_for_shard_same_shard() {
+        let num_shards = 4u64;
+        let accounts = AccountPool::generate(num_shards, 10).unwrap();
+        let workload =
+            TransferWorkload::new(NetworkDefinition::simulator()).with_cross_shard_ratio(0.0); // All same-shard
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Generate transactions targeting shard 2
+        let target_shard = ShardGroupId(2);
+        for _ in 0..20 {
+            let tx = workload
+                .generate_for_shard(&accounts, target_shard, &mut rng)
+                .expect("Should generate a transaction");
+
+            // All writes should be on the target shard
+            for write in &tx.declared_writes {
+                let write_shard = shard_for_node(write, num_shards);
+                assert_eq!(
+                    write_shard, target_shard,
+                    "Same-shard transaction should only write to target shard"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_for_shard_cross_shard() {
+        let num_shards = 4u64;
+        let accounts = AccountPool::generate(num_shards, 10).unwrap();
+        let workload =
+            TransferWorkload::new(NetworkDefinition::simulator()).with_cross_shard_ratio(1.0); // All cross-shard
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Generate transactions targeting shard 1
+        let target_shard = ShardGroupId(1);
+        for _ in 0..20 {
+            let tx = workload
+                .generate_for_shard(&accounts, target_shard, &mut rng)
+                .expect("Should generate a transaction");
+
+            // Transaction should be cross-shard
+            assert!(
+                tx.is_cross_shard(num_shards),
+                "Should be a cross-shard transaction"
+            );
+
+            // At least one write should be on the target shard
+            let shards_written: std::collections::HashSet<_> = tx
+                .declared_writes
+                .iter()
+                .map(|w| shard_for_node(w, num_shards))
+                .collect();
+            assert!(
+                shards_written.contains(&target_shard),
+                "Cross-shard transaction should involve target shard"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_batch_for_shard() {
+        let num_shards = 3u64;
+        let accounts = AccountPool::generate(num_shards, 10).unwrap();
+        let workload =
+            TransferWorkload::new(NetworkDefinition::simulator()).with_cross_shard_ratio(0.5);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Generate a batch targeting shard 0
+        let target_shard = ShardGroupId(0);
+        let batch = workload.generate_batch_for_shard(&accounts, target_shard, 50, &mut rng);
+
+        assert!(!batch.is_empty(), "Should generate transactions");
+
+        // All transactions should involve the target shard
+        for tx in &batch {
+            let shards_involved: std::collections::HashSet<_> = tx
+                .declared_writes
+                .iter()
+                .chain(tx.declared_reads.iter())
+                .map(|n| shard_for_node(n, num_shards))
+                .collect();
+
+            assert!(
+                shards_involved.contains(&target_shard),
+                "All transactions should involve the target shard"
+            );
+        }
     }
 }

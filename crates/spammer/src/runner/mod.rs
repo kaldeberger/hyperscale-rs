@@ -4,8 +4,8 @@ use crate::accounts::AccountPool;
 use crate::client::{RpcClient, RpcError};
 use crate::config::SpammerConfig;
 use crate::latency::{LatencyReport, LatencyTracker};
-use crate::workloads::{TransferWorkload, WorkloadGenerator};
-use hyperscale_types::{shard_for_node, RoutableTransaction};
+use crate::workloads::TransferWorkload;
+use hyperscale_types::{RoutableTransaction, ShardGroupId};
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
 use rand::{Rng, SeedableRng};
@@ -16,10 +16,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Transaction spammer that submits to real network endpoints.
+///
+/// Distributes transactions equally across shards, ensuring each shard's validators
+/// only receive transactions that are relevant to that shard (i.e., transactions
+/// that involve accounts on that shard).
 pub struct Spammer {
     config: SpammerConfig,
     accounts: AccountPool,
-    workload: Box<dyn WorkloadGenerator>,
+    workload: TransferWorkload,
     clients: Vec<RpcClient>,
     stats: SpammerStats,
     rng: ChaCha8Rng,
@@ -51,11 +55,9 @@ impl Spammer {
         let clients: Vec<RpcClient> = config.rpc_endpoints.iter().map(RpcClient::new).collect();
 
         // Create workload generator
-        let workload = Box::new(
-            TransferWorkload::new(config.network.clone())
-                .with_cross_shard_ratio(config.cross_shard_ratio)
-                .with_selection_mode(config.selection_mode),
-        );
+        let workload = TransferWorkload::new(config.network.clone())
+            .with_cross_shard_ratio(config.cross_shard_ratio)
+            .with_selection_mode(config.selection_mode);
 
         // Create latency tracker if enabled
         let latency_tracker = if config.latency_tracking {
@@ -115,12 +117,18 @@ impl Spammer {
             tracker.start_polling();
         }
 
+        // Calculate transactions per shard per batch (distribute equally)
+        let num_shards = self.config.num_shards as usize;
+        let txs_per_shard = (self.config.batch_size + num_shards - 1) / num_shards;
+
         info!(
             target_tps = self.config.target_tps,
             batch_size = self.config.batch_size,
             batch_interval_ms = batch_interval.as_millis(),
             latency_tracking = self.latency_tracker.is_some(),
-            "Starting spammer"
+            num_shards = num_shards,
+            txs_per_shard = txs_per_shard,
+            "Starting spammer (shard-targeted mode)"
         );
 
         loop {
@@ -128,14 +136,23 @@ impl Spammer {
                 break;
             }
 
-            // Generate a batch of transactions
-            let batch =
-                self.workload
-                    .generate_batch(&self.accounts, self.config.batch_size, &mut self.rng);
+            // Generate and submit batches per shard to ensure equal distribution
+            // and that each shard only receives relevant transactions
+            for shard_idx in 0..num_shards {
+                let target_shard = ShardGroupId(shard_idx as u64);
 
-            // Submit all transactions in the batch
-            for tx in batch {
-                self.submit_transaction(tx).await;
+                // Generate transactions that involve this shard
+                let batch = self.workload.generate_batch_for_shard(
+                    &self.accounts,
+                    target_shard,
+                    txs_per_shard,
+                    &mut self.rng,
+                );
+
+                // Submit all transactions to validators of this shard
+                for tx in batch {
+                    self.submit_transaction_to_shard(tx, shard_idx).await;
+                }
             }
 
             // Print progress periodically
@@ -179,18 +196,15 @@ impl Spammer {
         }
     }
 
-    /// Submit a single transaction to the appropriate shard endpoint.
+    /// Submit a single transaction to a specific shard's validators.
     ///
-    /// Distributes load across all validators in the target shard using round-robin.
-    async fn submit_transaction(&mut self, tx: RoutableTransaction) {
+    /// The `target_shard` parameter specifies which shard's validators should receive
+    /// this transaction. Load is distributed across validators in that shard using round-robin.
+    ///
+    /// This ensures transactions are only sent to validators that are relevant to the
+    /// transaction (i.e., validators in shards that the transaction touches).
+    async fn submit_transaction_to_shard(&mut self, tx: RoutableTransaction, target_shard: usize) {
         self.stats.submitted.fetch_add(1, Ordering::SeqCst);
-
-        // Determine which shard to submit to based on the transaction's writes
-        let target_shard = if let Some(first_write) = tx.declared_writes.first() {
-            shard_for_node(first_write, self.config.num_shards).0 as usize
-        } else {
-            0
-        };
 
         // Calculate client index using round-robin within the shard.
         // Endpoints are expected to be organized as: shard0_v0, shard0_v1, ..., shard1_v0, ...

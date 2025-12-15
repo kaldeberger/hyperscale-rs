@@ -778,6 +778,71 @@ impl ProductionRunner {
                     break;
                 }
 
+                // METRICS: Check early to avoid starvation under load (non-blocking, fast)
+                _ = metrics_tick.tick() => {
+                    // Update thread pool queue depths (non-blocking)
+                    crate::metrics::set_pool_queue_depths(
+                        self.thread_pools.crypto_queue_depth(),
+                        self.thread_pools.execution_queue_depth(),
+                    );
+
+                    // Update event channel depths (non-blocking)
+                    crate::metrics::set_channel_depths(&crate::metrics::ChannelDepths {
+                        callback: self.callback_rx.len(),
+                        consensus: self.consensus_rx.len(),
+                        validated_tx: self.validated_tx_rx.len(),
+                        rpc_tx: self.rpc_tx_rx.len(),
+                        status: self.status_rx.len(),
+                        sync_request: self.sync_request_rx.len(),
+                        tx_request: self.tx_request_rx.len(),
+                        cert_request: self.cert_request_rx.len(),
+                    });
+
+                    // Update sync status (non-blocking)
+                    crate::metrics::set_sync_status(
+                        self.sync_manager.blocks_behind(),
+                        self.sync_manager.is_syncing(),
+                    );
+
+                    // Update fetch status (non-blocking)
+                    let fetch_status = self.fetch_manager.status();
+                    crate::metrics::set_fetch_in_flight(fetch_status.in_flight_requests);
+
+                    // Update peer count using cached value (non-blocking)
+                    let peer_count = self.network.cached_peer_count();
+                    crate::metrics::set_libp2p_peers(peer_count);
+
+                    // Update RPC status with peer count (non-blocking: skip if contended)
+                    if let Some(ref rpc_status) = self.rpc_status {
+                        if let Ok(mut status) = rpc_status.try_write() {
+                            status.connected_peers = peer_count;
+                        }
+                    }
+
+                    // Update BFT metrics (view changes, round)
+                    let bft_stats = self.state.bft().stats();
+                    crate::metrics::set_bft_stats(&bft_stats);
+
+                    // Update mempool snapshot for RPC queries (non-blocking: skip if contended)
+                    if let Some(ref snapshot) = self.mempool_snapshot {
+                        let stats = self.state.mempool().lock_contention_stats();
+                        let total = self.state.mempool().len();
+
+                        // Update Prometheus metrics
+                        crate::metrics::set_mempool_size(total);
+                        crate::metrics::set_lock_contention_from_stats(&stats);
+
+                        if let Ok(mut snap) = snapshot.try_write() {
+                            snap.pending_count = stats.pending_count as usize;
+                            snap.committed_count = stats.committed_count as usize;
+                            snap.executed_count = stats.executed_count as usize;
+                            snap.blocked_count = stats.blocked_count as usize;
+                            snap.total_count = total;
+                            snap.updated_at = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+
                 // CRITICAL PRIORITY: Timer events (proposal, cleanup)
                 // Timers have their own dedicated channel to ensure they are NEVER blocked
                 // by network floods. This is critical for liveness - if timers stop firing,
@@ -1134,60 +1199,6 @@ impl ProductionRunner {
                         if let Err(e) = self.process_action(action).await {
                             tracing::error!(error = ?e, "Error processing status action");
                         }
-                    }
-                }
-
-                // Periodic metrics update (1 second)
-                // IMPORTANT: This branch must NOT block on async operations to avoid
-                // delaying consensus processing. Use non-blocking variants only.
-                _ = metrics_tick.tick() => {
-                    // Update thread pool queue depths (non-blocking)
-                    crate::metrics::set_pool_queue_depths(
-                        self.thread_pools.crypto_queue_depth(),
-                        self.thread_pools.execution_queue_depth(),
-                    );
-
-                    // Update sync status (non-blocking)
-                    crate::metrics::set_sync_status(
-                        self.sync_manager.blocks_behind(),
-                        self.sync_manager.is_syncing(),
-                    );
-
-                    // Update fetch status (non-blocking)
-                    let fetch_status = self.fetch_manager.status();
-                    crate::metrics::set_fetch_in_flight(fetch_status.in_flight_requests);
-
-                    // Update peer count using cached value (non-blocking)
-                    // The cache is updated by the network event loop on connection changes
-                    let peer_count = self.network.cached_peer_count();
-                    crate::metrics::set_libp2p_peers(peer_count);
-
-                    // Update RPC status with peer count (non-blocking: skip if contended)
-                    if let Some(ref rpc_status) = self.rpc_status {
-                        if let Ok(mut status) = rpc_status.try_write() {
-                            status.connected_peers = peer_count;
-                        }
-                        // If lock is contended, skip this update - RPC is reading
-                    }
-
-                    // Update mempool snapshot for RPC queries (non-blocking: skip if contended)
-                    if let Some(ref snapshot) = self.mempool_snapshot {
-                        let stats = self.state.mempool().lock_contention_stats();
-                        let total = self.state.mempool().len();
-
-                        // Update Prometheus metrics
-                        crate::metrics::set_mempool_size(total);
-                        crate::metrics::set_lock_contention_from_stats(&stats);
-
-                        if let Ok(mut snap) = snapshot.try_write() {
-                            snap.pending_count = stats.pending_count as usize;
-                            snap.committed_count = stats.committed_count as usize;
-                            snap.executed_count = stats.executed_count as usize;
-                            snap.blocked_count = stats.blocked_count as usize;
-                            snap.total_count = total;
-                            snap.updated_at = Some(std::time::Instant::now());
-                        }
-                        // If lock is contended, skip this update - RPC is reading
                     }
                 }
             }

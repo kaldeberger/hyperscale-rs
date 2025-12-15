@@ -5,6 +5,17 @@
 
 use hyperscale_core::{Action, Event, OutboundMessage, SubStateMachine, TimerId};
 
+/// BFT statistics for monitoring.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BftStats {
+    /// Total number of view changes (round advances due to timeout).
+    pub view_changes: u64,
+    /// Current round within the current height.
+    pub current_round: u64,
+    /// Current committed height.
+    pub committed_height: u64,
+}
+
 /// Index type for simulation-only node routing.
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
@@ -211,6 +222,12 @@ pub struct BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     /// Current time (set by runner before each handle call).
     now: Duration,
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Statistics
+    // ═══════════════════════════════════════════════════════════════════════════
+    /// Total number of view changes (round advances due to timeout).
+    view_changes: u64,
 }
 
 impl std::fmt::Debug for BftState {
@@ -281,6 +298,7 @@ impl BftState {
             pending_commits_awaiting_data: HashMap::new(),
             config,
             now: Duration::ZERO,
+            view_changes: 0,
         }
     }
 
@@ -2557,12 +2575,14 @@ impl BftState {
             .unwrap_or(self.committed_height + 1);
         let old_round = self.view;
         self.view += 1;
+        self.view_changes += 1;
 
         info!(
             validator = ?self.validator_id(),
             height = height,
             old_round = old_round,
             new_round = self.view,
+            view_changes = self.view_changes,
             "Advancing round locally (implicit view change)"
         );
 
@@ -3417,6 +3437,15 @@ impl BftState {
     /// Get the current view/round.
     pub fn view(&self) -> u64 {
         self.view
+    }
+
+    /// Get BFT statistics for monitoring.
+    pub fn stats(&self) -> BftStats {
+        BftStats {
+            view_changes: self.view_changes,
+            current_round: self.view,
+            committed_height: self.committed_height,
+        }
     }
 
     /// Get the BFT configuration.

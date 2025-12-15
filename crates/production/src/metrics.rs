@@ -17,7 +17,10 @@ pub struct Metrics {
     pub blocks_committed: Counter,
     pub block_commit_latency: Histogram,
     pub block_height: Gauge,
-    pub view_changes: Counter,
+    /// Current BFT round number within the current height.
+    pub round: Gauge,
+    /// Total number of view changes (round advances due to timeout).
+    pub view_changes: Gauge,
 
     // === Transactions ===
     pub transactions_finalized: HistogramVec,
@@ -34,6 +37,24 @@ pub struct Metrics {
     // === Thread Pools ===
     pub crypto_pool_queue_depth: Gauge,
     pub execution_pool_queue_depth: Gauge,
+
+    // === Event Channel Depths ===
+    /// Depth of the callback channel (crypto/execution results).
+    pub callback_channel_depth: Gauge,
+    /// Depth of the consensus channel (BFT network messages).
+    pub consensus_channel_depth: Gauge,
+    /// Depth of the validated transactions channel.
+    pub validated_tx_channel_depth: Gauge,
+    /// Depth of the RPC transaction submission channel.
+    pub rpc_tx_channel_depth: Gauge,
+    /// Depth of the status channel (transaction status updates).
+    pub status_channel_depth: Gauge,
+    /// Depth of the inbound sync request channel.
+    pub sync_request_channel_depth: Gauge,
+    /// Depth of the inbound transaction fetch request channel.
+    pub tx_request_channel_depth: Gauge,
+    /// Depth of the inbound certificate fetch request channel.
+    pub cert_request_channel_depth: Gauge,
 
     // === Storage ===
     pub rocksdb_read_latency: Histogram,
@@ -104,9 +125,15 @@ impl Metrics {
             block_height: register_gauge!("hyperscale_block_height", "Current block height")
                 .unwrap(),
 
-            view_changes: register_counter!(
-                "hyperscale_view_changes_total",
-                "Total number of view changes triggered"
+            round: register_gauge!(
+                "hyperscale_round",
+                "Current BFT round within current height"
+            )
+            .unwrap(),
+
+            view_changes: register_gauge!(
+                "hyperscale_view_changes",
+                "Total number of view changes (round advances due to timeout)"
             )
             .unwrap(),
 
@@ -162,6 +189,55 @@ impl Metrics {
             execution_pool_queue_depth: register_gauge!(
                 "hyperscale_execution_pool_queue_depth",
                 "Number of pending tasks in execution pool"
+            )
+            .unwrap(),
+
+            // Event Channel Depths
+            callback_channel_depth: register_gauge!(
+                "hyperscale_callback_channel_depth",
+                "Depth of callback channel (crypto/execution results)"
+            )
+            .unwrap(),
+
+            consensus_channel_depth: register_gauge!(
+                "hyperscale_consensus_channel_depth",
+                "Depth of consensus channel (BFT network messages)"
+            )
+            .unwrap(),
+
+            validated_tx_channel_depth: register_gauge!(
+                "hyperscale_validated_tx_channel_depth",
+                "Depth of validated transactions channel"
+            )
+            .unwrap(),
+
+            rpc_tx_channel_depth: register_gauge!(
+                "hyperscale_rpc_tx_channel_depth",
+                "Depth of RPC transaction submission channel"
+            )
+            .unwrap(),
+
+            status_channel_depth: register_gauge!(
+                "hyperscale_status_channel_depth",
+                "Depth of status channel (transaction status updates)"
+            )
+            .unwrap(),
+
+            sync_request_channel_depth: register_gauge!(
+                "hyperscale_sync_request_channel_depth",
+                "Depth of inbound sync request channel"
+            )
+            .unwrap(),
+
+            tx_request_channel_depth: register_gauge!(
+                "hyperscale_tx_request_channel_depth",
+                "Depth of inbound transaction fetch request channel"
+            )
+            .unwrap(),
+
+            cert_request_channel_depth: register_gauge!(
+                "hyperscale_cert_request_channel_depth",
+                "Depth of inbound certificate fetch request channel"
             )
             .unwrap(),
 
@@ -384,9 +460,11 @@ pub fn record_transaction_finalized(latency_secs: f64, cross_shard: bool) {
         .observe(latency_secs);
 }
 
-/// Record a view change.
-pub fn record_view_change() {
-    metrics().view_changes.inc();
+/// Update BFT metrics from BftStats.
+pub fn set_bft_stats(stats: &hyperscale_bft::BftStats) {
+    let m = metrics();
+    m.round.set(stats.current_round as f64);
+    m.view_changes.set(stats.view_changes as f64);
 }
 
 /// Update mempool size.
@@ -404,6 +482,40 @@ pub fn set_pool_queue_depths(crypto: usize, execution: usize) {
     let m = metrics();
     m.crypto_pool_queue_depth.set(crypto as f64);
     m.execution_pool_queue_depth.set(execution as f64);
+}
+
+/// Channel depth statistics for the event loop.
+#[derive(Debug, Default)]
+pub struct ChannelDepths {
+    /// Callback channel (crypto/execution results).
+    pub callback: usize,
+    /// Consensus channel (BFT network messages).
+    pub consensus: usize,
+    /// Validated transactions channel.
+    pub validated_tx: usize,
+    /// RPC transaction submissions channel.
+    pub rpc_tx: usize,
+    /// Status updates channel.
+    pub status: usize,
+    /// Inbound sync request channel.
+    pub sync_request: usize,
+    /// Inbound transaction fetch request channel.
+    pub tx_request: usize,
+    /// Inbound certificate fetch request channel.
+    pub cert_request: usize,
+}
+
+/// Update event channel depths.
+pub fn set_channel_depths(depths: &ChannelDepths) {
+    let m = metrics();
+    m.callback_channel_depth.set(depths.callback as f64);
+    m.consensus_channel_depth.set(depths.consensus as f64);
+    m.validated_tx_channel_depth.set(depths.validated_tx as f64);
+    m.rpc_tx_channel_depth.set(depths.rpc_tx as f64);
+    m.status_channel_depth.set(depths.status as f64);
+    m.sync_request_channel_depth.set(depths.sync_request as f64);
+    m.tx_request_channel_depth.set(depths.tx_request as f64);
+    m.cert_request_channel_depth.set(depths.cert_request as f64);
 }
 
 /// Record RocksDB read latency.

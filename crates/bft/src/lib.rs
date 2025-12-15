@@ -63,5 +63,5 @@ mod vote_set;
 
 pub use config::BftConfig;
 pub use pending::PendingBlock;
-pub use state::{BftState, RecoveredState};
+pub use state::{BftState, BftStats, RecoveredState};
 pub use vote_set::VoteSet;

@@ -1,7 +1,7 @@
 //! Node state machine.
 
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
-use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, SubStateMachine, TimerId};
+use hyperscale_core::{Action, Event, StateMachine, SubStateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::MempoolState;
@@ -386,27 +386,16 @@ impl StateMachine for NodeStateMachine {
                 }
             }
 
-            // SubmitTransaction needs special handling to add gossip broadcast
+            // SubmitTransaction: add to local mempool only.
+            // Gossip is handled by the runner before this event is sent, so we only
+            // need to add to the mempool here.
             Event::SubmitTransaction { tx } => {
-                let mut actions = Vec::new();
-
                 // Only add to our mempool if this transaction involves our shard.
-                // Cross-shard transactions that don't touch our shard should only be
-                // forwarded via gossip, not stored locally.
+                // The runner will have already gossiped to all relevant shards.
                 if self.topology.involves_local_shard(tx) {
-                    actions.extend(self.mempool.on_submit_transaction_arc(Arc::clone(tx)));
+                    return self.mempool.on_submit_transaction_arc(Arc::clone(tx));
                 }
-
-                // Broadcast transaction to all shards involved in this transaction
-                let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
-                for shard in self.topology.all_shards_for_transaction(tx) {
-                    actions.push(Action::BroadcastToShard {
-                        message: OutboundMessage::TransactionGossip(Box::new(gossip.clone())),
-                        shard,
-                    });
-                }
-
-                return actions;
+                return vec![];
             }
 
             // TransactionExecuted is emitted by execution, handled by mempool AND BFT

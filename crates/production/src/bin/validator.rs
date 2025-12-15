@@ -954,8 +954,10 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to create production runner")?;
 
-    // Get event sender for transaction injection
-    let event_sender = runner.event_sender();
+    // Get transaction sender for transaction injection
+    // Use transaction_sender() rather than event_sender() so that transactions
+    // are gossiped to relevant shards before being dispatched to the state machine.
+    let transaction_sender = runner.transaction_sender();
 
     // Get shutdown handle
     let shutdown_handle = runner.shutdown_handle();
@@ -963,8 +965,9 @@ async fn main() -> Result<()> {
     // Spawn transaction forwarder (RPC -> event loop)
     tokio::spawn(async move {
         while let Some(tx) = tx_receiver.recv().await {
-            // Submit transaction via the proper submit path (emits status updates)
-            if let Err(e) = event_sender
+            // Submit transaction via the transaction channel (emits status updates)
+            // The runner will gossip to relevant shards before dispatching to state machine
+            if let Err(e) = transaction_sender
                 .send(Event::SubmitTransaction {
                     tx: std::sync::Arc::new(tx),
                 })

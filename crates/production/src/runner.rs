@@ -13,7 +13,7 @@ use hyperscale_bft::BftConfig;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_types::BlockHeight;
 
-use hyperscale_core::{Action, Event, StateMachine};
+use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, BlockHeader, BlockVote, Hash, KeyPair, PublicKey, QuorumCertificate,
@@ -546,9 +546,21 @@ impl ProductionRunner {
         self.local_shard
     }
 
-    /// Get a sender for submitting events.
+    /// Get a sender for submitting consensus events.
+    ///
+    /// This is the high-priority channel for BFT messages.
+    /// For transaction submission, use `transaction_sender()` instead.
     pub fn event_sender(&self) -> mpsc::Sender<Event> {
         self.consensus_tx.clone()
+    }
+
+    /// Get a sender for submitting transactions.
+    ///
+    /// This is the appropriate channel for `SubmitTransaction` events.
+    /// Transactions sent via this channel will be gossiped to relevant shards
+    /// before being dispatched to the state machine.
+    pub fn transaction_sender(&self) -> mpsc::Sender<Event> {
+        self.transaction_tx.clone()
     }
 
     /// Get the transaction validator for signature verification.
@@ -947,6 +959,24 @@ impl ProductionRunner {
                                 }
                             }
                             // If cache lock is contended, let the mempool handle dedup
+                        }
+                    }
+
+                    // For SubmitTransaction events, gossip to all relevant shards first.
+                    // This moves gossip responsibility from the state machine to the runner,
+                    // avoiding unnecessary state machine thrashing for broadcast actions.
+                    if let Event::SubmitTransaction { ref tx } = event {
+                        let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
+                        for shard in self.topology.all_shards_for_transaction(tx) {
+                            let mut message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
+                            message.inject_trace_context();
+                            if let Err(e) = self.network.broadcast_shard(shard, &message).await {
+                                tracing::warn!(
+                                    ?shard,
+                                    error = ?e,
+                                    "Failed to gossip transaction to shard"
+                                );
+                            }
                         }
                     }
 

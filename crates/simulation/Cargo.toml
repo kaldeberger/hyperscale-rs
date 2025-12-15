@@ -8,6 +8,7 @@ description = "Simulation runner"
 hyperscale-core.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
+hyperscale-messages.workspace = true
 hyperscale-node.workspace = true
 hyperscale-types.workspace = true
 # Radix dependencies for real execution

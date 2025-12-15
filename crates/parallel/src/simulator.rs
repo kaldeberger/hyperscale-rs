@@ -345,6 +345,20 @@ impl SimNode {
 
     /// Handle a single event.
     fn handle_event(&mut self, event: Event, cache: &SimulationCache) {
+        // For SubmitTransaction events, gossip to all relevant shards first.
+        // This mirrors production behavior where the runner handles gossip,
+        // not the state machine.
+        if let Event::SubmitTransaction { ref tx } = event {
+            let topology = self.state.topology();
+            let gossip =
+                hyperscale_messages::TransactionGossip::from_arc(std::sync::Arc::clone(tx));
+            for shard in topology.all_shards_for_transaction(tx) {
+                let message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
+                self.outbound_messages
+                    .push((Destination::Shard(shard), Arc::new(message)));
+            }
+        }
+
         // Process through state machine (time is set by advance_time)
         let actions = self.state.handle(event);
 

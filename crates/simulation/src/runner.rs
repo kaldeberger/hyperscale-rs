@@ -539,6 +539,23 @@ impl SimulationRunner {
             self.stats.events_processed += 1;
             self.stats.events_by_priority[event.priority() as usize] += 1;
 
+            // For SubmitTransaction events, gossip to all relevant shards first.
+            // This mirrors production behavior where the runner handles gossip,
+            // not the state machine.
+            if let Event::SubmitTransaction { ref tx } = event {
+                let topology = self.nodes[node_index as usize].topology();
+                let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
+                for shard in topology.all_shards_for_transaction(tx) {
+                    let message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
+                    let peers = self.network.peers_in_shard(shard);
+                    for to in peers {
+                        if to != node_index {
+                            self.try_deliver_message(node_index, to, &message);
+                        }
+                    }
+                }
+            }
+
             // Update node's time and process event
             let node = &mut self.nodes[node_index as usize];
             node.set_time(self.now);

@@ -7,6 +7,7 @@ description = "Parallel (non-deterministic) simulation for multi-core performanc
 [dependencies]
 # Core dependencies
 hyperscale-core.workspace = true
+hyperscale-messages.workspace = true
 hyperscale-node.workspace = true
 hyperscale-types.workspace = true
 hyperscale-bft.workspace = true

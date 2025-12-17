@@ -1410,36 +1410,53 @@ impl ProductionRunner {
                 let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
+                let thread_pools = self.thread_pools.clone();
 
                 self.thread_pools.spawn_execution(move || {
                     let start = std::time::Instant::now();
-                    // Execute transactions - RocksDB is internally thread-safe
-                    let results = match executor.execute_single_shard(&*storage, &transactions) {
-                        Ok(output) => output
-                            .results()
-                            .iter()
-                            .map(|r| hyperscale_types::ExecutionResult {
-                                transaction_hash: r.tx_hash,
-                                success: r.success,
-                                state_root: r.outputs_merkle_root,
-                                writes: r.state_writes.clone(),
-                                error: r.error.clone(),
-                            })
-                            .collect(),
-                        Err(e) => {
-                            tracing::warn!(?block_hash, error = %e, "Transaction execution failed");
+                    // Execute transactions in parallel using all execution pool threads.
+                    // Each transaction gets its own storage snapshot for isolated execution.
+                    // RocksDB snapshots are thread-safe and support concurrent reads.
+                    let results: Vec<hyperscale_types::ExecutionResult> =
+                        thread_pools.execution_pool().install(|| {
+                            use rayon::prelude::*;
                             transactions
-                                .iter()
-                                .map(|tx| hyperscale_types::ExecutionResult {
-                                    transaction_hash: tx.hash(),
-                                    success: false,
-                                    state_root: hyperscale_types::Hash::ZERO,
-                                    writes: vec![],
-                                    error: Some(format!("{}", e)),
+                                .par_iter()
+                                .map(|tx| {
+                                    match executor.execute_single_shard(&*storage, &[tx.clone()]) {
+                                        Ok(output) => {
+                                            if let Some(r) = output.results().first() {
+                                                hyperscale_types::ExecutionResult {
+                                                    transaction_hash: r.tx_hash,
+                                                    success: r.success,
+                                                    state_root: r.outputs_merkle_root,
+                                                    writes: r.state_writes.clone(),
+                                                    error: r.error.clone(),
+                                                }
+                                            } else {
+                                                hyperscale_types::ExecutionResult {
+                                                    transaction_hash: tx.hash(),
+                                                    success: false,
+                                                    state_root: hyperscale_types::Hash::ZERO,
+                                                    writes: vec![],
+                                                    error: Some("No execution result".to_string()),
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Transaction execution failed");
+                                            hyperscale_types::ExecutionResult {
+                                                transaction_hash: tx.hash(),
+                                                success: false,
+                                                state_root: hyperscale_types::Hash::ZERO,
+                                                writes: vec![],
+                                                error: Some(format!("{}", e)),
+                                            }
+                                        }
+                                    }
                                 })
                                 .collect()
-                        }
-                    };
+                        });
                     crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
                     event_tx

@@ -58,7 +58,7 @@ impl std::fmt::Debug for NodeStateMachine {
 }
 
 impl NodeStateMachine {
-    /// Create a new node state machine.
+    /// Create a new node state machine with default speculative execution settings.
     ///
     /// # Arguments
     ///
@@ -74,6 +74,27 @@ impl NodeStateMachine {
         bft_config: BftConfig,
         recovered: RecoveredState,
     ) -> Self {
+        Self::with_speculative_config(
+            node_index,
+            topology,
+            signing_key,
+            bft_config,
+            recovered,
+            hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS,
+            hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
+        )
+    }
+
+    /// Create a new node state machine with custom speculative execution config.
+    pub fn with_speculative_config(
+        node_index: NodeIndex,
+        topology: Arc<dyn Topology>,
+        signing_key: KeyPair,
+        bft_config: BftConfig,
+        recovered: RecoveredState,
+        speculative_max_txs: usize,
+        view_change_cooldown_rounds: u64,
+    ) -> Self {
         let local_shard = topology.local_shard();
 
         Self {
@@ -86,7 +107,12 @@ impl NodeStateMachine {
                 bft_config.clone(),
                 recovered,
             ),
-            execution: ExecutionState::new(topology.clone(), signing_key),
+            execution: ExecutionState::with_speculative_config(
+                topology.clone(),
+                signing_key,
+                speculative_max_txs,
+                view_change_cooldown_rounds,
+            ),
             mempool: MempoolState::new(topology.clone()),
             livelock: LivelockState::new(local_shard, topology),
             now: Duration::ZERO,
@@ -127,6 +153,11 @@ impl NodeStateMachine {
     /// Get a reference to the execution state.
     pub fn execution(&self) -> &ExecutionState {
         &self.execution
+    }
+
+    /// Get a mutable reference to the execution state.
+    pub fn execution_mut(&mut self) -> &mut ExecutionState {
+        &mut self.execution
     }
 
     /// Get a reference to the livelock state.
@@ -170,6 +201,11 @@ impl NodeStateMachine {
         let current_height = BlockHeight(self.bft.committed_height());
         self.mempool
             .cleanup_old_tombstones(current_height, TOMBSTONE_RETENTION_BLOCKS);
+
+        // Clean up stale speculative execution results (30 second timeout)
+        const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);
+        self.execution
+            .cleanup_stale_speculative(SPECULATIVE_MAX_AGE);
 
         actions
     }
@@ -223,6 +259,9 @@ impl StateMachine for NodeStateMachine {
                     );
                     let certificates = self.execution.get_finalized_certificates();
 
+                    // Notify execution of view change to pause speculation temporarily
+                    self.execution.on_view_change(current_height.0);
+
                     tracing::info!("Round timeout - advancing round (implicit view change)");
                     return self
                         .bft
@@ -259,7 +298,20 @@ impl StateMachine for NodeStateMachine {
             } => {
                 let mempool_txs = self.mempool.transactions_by_hash();
                 let local_certs = self.execution.finalized_certificates_by_hash();
-                return self.bft.on_block_header(
+
+                // Trigger speculative execution for single-shard transactions
+                // This hides execution latency behind consensus latency
+                let block_hash = header.hash();
+                let height = header.height.0;
+                let transactions: Vec<_> = tx_hashes
+                    .iter()
+                    .filter_map(|h| mempool_txs.get(h).cloned())
+                    .collect();
+                let spec_actions =
+                    self.execution
+                        .trigger_speculative_execution(block_hash, height, transactions);
+
+                let mut actions = self.bft.on_block_header(
                     header.clone(),
                     tx_hashes.clone(),
                     cert_hashes.clone(),
@@ -268,6 +320,8 @@ impl StateMachine for NodeStateMachine {
                     &mempool_txs,
                     &local_certs,
                 );
+                actions.extend(spec_actions);
+                return actions;
             }
 
             // QuorumCertificateFormed may trigger immediate proposal, so pass mempool
@@ -340,9 +394,12 @@ impl StateMachine for NodeStateMachine {
 
                 // Remove committed certificates from execution state
                 // They've been included in this block, so don't need to be proposed again
+                // Also invalidate any speculative results that conflict with these writes
                 for cert in &block.committed_certificates {
                     self.execution
                         .remove_finalized_certificate(&cert.transaction_hash);
+                    // Invalidate speculative results that read from nodes being written
+                    self.execution.invalidate_speculative_on_commit(cert);
                 }
 
                 // Pass transactions directly from block to execution (no need for mempool lookup)
@@ -380,7 +437,8 @@ impl StateMachine for NodeStateMachine {
             | Event::MerkleRootComputed { .. }
             | Event::ProvisionSignatureVerified { .. }
             | Event::StateVoteSignatureVerified { .. }
-            | Event::StateCertificateSignatureVerified { .. } => {
+            | Event::StateCertificateSignatureVerified { .. }
+            | Event::SpeculativeExecutionComplete { .. } => {
                 if let Some(actions) = self.execution.try_handle(&event) {
                     return actions;
                 }

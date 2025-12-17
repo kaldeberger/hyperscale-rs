@@ -34,6 +34,13 @@ pub struct Metrics {
     pub network_messages_received: Counter,
     pub signature_verification_latency: Histogram,
     pub execution_latency: Histogram,
+    pub speculative_execution_latency: Histogram,
+
+    // === Speculative Execution ===
+    pub speculative_execution_started: Counter,
+    pub speculative_execution_cache_hit: Counter,
+    pub speculative_execution_cache_miss: Counter,
+    pub speculative_execution_invalidated: Counter,
 
     // === Thread Pools ===
     pub crypto_pool_queue_depth: Gauge,
@@ -184,6 +191,38 @@ impl Metrics {
                 "hyperscale_execution_latency_seconds",
                 "Transaction execution latency",
                 vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+            )
+            .unwrap(),
+
+            speculative_execution_latency: register_histogram!(
+                "hyperscale_speculative_execution_latency_seconds",
+                "Speculative transaction execution latency (before block commit)",
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+            )
+            .unwrap(),
+
+            // Speculative Execution Counters
+            speculative_execution_started: register_counter!(
+                "hyperscale_speculative_execution_started_total",
+                "Total speculative executions triggered"
+            )
+            .unwrap(),
+
+            speculative_execution_cache_hit: register_counter!(
+                "hyperscale_speculative_execution_cache_hit_total",
+                "Speculative execution results used on block commit"
+            )
+            .unwrap(),
+
+            speculative_execution_cache_miss: register_counter!(
+                "hyperscale_speculative_execution_cache_miss_total",
+                "Block commits requiring re-execution (no cached result)"
+            )
+            .unwrap(),
+
+            speculative_execution_invalidated: register_counter!(
+                "hyperscale_speculative_execution_invalidated_total",
+                "Speculative results invalidated due to state conflicts"
             )
             .unwrap(),
 
@@ -712,6 +751,33 @@ pub fn record_signature_verification_latency(latency_secs: f64) {
 /// Record execution latency.
 pub fn record_execution_latency(latency_secs: f64) {
     metrics().execution_latency.observe(latency_secs);
+}
+
+/// Record speculative execution latency.
+pub fn record_speculative_execution_latency(latency_secs: f64) {
+    metrics()
+        .speculative_execution_latency
+        .observe(latency_secs);
+}
+
+/// Record speculative execution started.
+pub fn record_speculative_execution_started(count: u64) {
+    metrics().speculative_execution_started.inc_by(count as f64);
+}
+
+/// Record speculative execution cache hit.
+pub fn record_speculative_execution_cache_hit() {
+    metrics().speculative_execution_cache_hit.inc();
+}
+
+/// Record speculative execution cache miss.
+pub fn record_speculative_execution_cache_miss() {
+    metrics().speculative_execution_cache_miss.inc();
+}
+
+/// Record speculative execution invalidated.
+pub fn record_speculative_execution_invalidated() {
+    metrics().speculative_execution_invalidated.inc();
 }
 
 /// Update lock contention metrics.

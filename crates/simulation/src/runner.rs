@@ -841,6 +841,65 @@ impl SimulationRunner {
                 );
             }
 
+            Action::SpeculativeExecute {
+                block_hash,
+                transactions,
+            } => {
+                // Speculatively execute single-shard transactions before block commit.
+                // This is identical to ExecuteTransactions but returns a different event.
+                // Results are cached and used when the block commits (if still valid).
+                let storage = &self.node_storage[from as usize];
+                let executor = &self.node_executor[from as usize];
+
+                let results: Vec<(hyperscale_types::Hash, hyperscale_types::ExecutionResult)> =
+                    match executor.execute_single_shard(storage, &transactions) {
+                        Ok(output) => output
+                            .results()
+                            .iter()
+                            .map(|r| {
+                                (
+                                    r.tx_hash,
+                                    hyperscale_types::ExecutionResult {
+                                        transaction_hash: r.tx_hash,
+                                        success: r.success,
+                                        state_root: r.outputs_merkle_root,
+                                        writes: r.state_writes.clone(),
+                                        error: r.error.clone(),
+                                    },
+                                )
+                            })
+                            .collect(),
+                        Err(e) => {
+                            // Execution failed - mark all transactions as failed
+                            warn!(node = from, ?block_hash, error = %e, "Speculative execution failed");
+                            transactions
+                                .iter()
+                                .map(|tx| {
+                                    (
+                                        tx.hash(),
+                                        hyperscale_types::ExecutionResult {
+                                            transaction_hash: tx.hash(),
+                                            success: false,
+                                            state_root: hyperscale_types::Hash::ZERO,
+                                            writes: vec![],
+                                            error: Some(format!("{}", e)),
+                                        },
+                                    )
+                                })
+                                .collect()
+                        }
+                    };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::SpeculativeExecutionComplete {
+                        block_hash,
+                        results,
+                    },
+                );
+            }
+
             Action::ExecuteCrossShardTransaction {
                 tx_hash,
                 transaction,

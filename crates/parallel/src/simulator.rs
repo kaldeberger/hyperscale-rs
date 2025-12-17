@@ -24,9 +24,9 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork};
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, Hash, KeyPair, NodeId, PublicKey, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, StaticTopology, Topology, TransactionDecision,
-    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    Block, BlockHeader, BlockHeight, ExecutionResult, Hash, KeyPair, NodeId, PublicKey,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StaticTopology, Topology,
+    TransactionDecision, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -488,6 +488,25 @@ impl SimNode {
                     block_hash,
                     results,
                 });
+            }
+
+            // Speculative execution - same as ExecuteTransactions but returns different event
+            Action::SpeculativeExecute {
+                block_hash,
+                transactions,
+            } => {
+                let shard_id = self.state.shard().0;
+                let execution_results = cache.execute_block(shard_id, block_hash, &transactions);
+                // Convert to (Hash, ExecutionResult) pairs
+                let results: Vec<(Hash, ExecutionResult)> = execution_results
+                    .into_iter()
+                    .map(|r| (r.transaction_hash, r))
+                    .collect();
+                self.internal_queue
+                    .push_back(Event::SpeculativeExecutionComplete {
+                        block_hash,
+                        results,
+                    });
             }
 
             Action::ExecuteCrossShardTransaction {

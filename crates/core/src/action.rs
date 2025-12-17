@@ -130,6 +130,24 @@ pub enum Action {
         state_root: Hash,
     },
 
+    /// Speculatively execute single-shard transactions before block commit.
+    ///
+    /// Triggered when a block header is received, before the block commits via
+    /// the 2-chain rule. This hides execution latency behind consensus latency.
+    ///
+    /// Results are cached and used when the block commits, if no conflicting
+    /// writes have occurred. If a speculative result is invalidated (due to
+    /// committed writes to the read set), the transaction falls back to normal
+    /// execution on commit.
+    ///
+    /// Returns `Event::SpeculativeExecutionComplete` when complete.
+    SpeculativeExecute {
+        /// Block hash where these transactions appear.
+        block_hash: Hash,
+        /// Single-shard transactions to execute speculatively.
+        transactions: Vec<Arc<RoutableTransaction>>,
+    },
+
     /// Execute a cross-shard transaction with provisioned state.
     ///
     /// Used after 2PC provisioning completes. The runner executes the transaction
@@ -422,6 +440,7 @@ impl Action {
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
                 | Action::ExecuteTransactions { .. }
+                | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
                 | Action::ComputeMerkleRoot { .. }
                 | Action::FetchStateEntries { .. }
@@ -478,6 +497,7 @@ impl Action {
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
+            Action::SpeculativeExecute { .. } => "SpeculativeExecute",
             Action::ExecuteCrossShardTransaction { .. } => "ExecuteCrossShardTransaction",
             Action::ComputeMerkleRoot { .. } => "ComputeMerkleRoot",
 

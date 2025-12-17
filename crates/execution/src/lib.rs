@@ -12,4 +12,4 @@ mod pending;
 mod state;
 pub mod trackers;
 
-pub use state::ExecutionState;
+pub use state::{ExecutionState, DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};

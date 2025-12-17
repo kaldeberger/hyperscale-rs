@@ -223,6 +223,16 @@ pub struct ConsensusConfig {
     /// Maximum certificates per block
     #[serde(default = "default_max_certificates_per_block")]
     pub max_certificates_per_block: usize,
+
+    /// Maximum transactions for speculative execution (in-flight + cached).
+    /// Higher values allow more aggressive speculation but use more memory.
+    #[serde(default = "default_speculative_max_txs")]
+    pub speculative_max_txs: usize,
+
+    /// Rounds to pause speculation after a view change.
+    /// Higher values reduce wasted work during instability but may reduce hit rate.
+    #[serde(default = "default_view_change_cooldown_rounds")]
+    pub view_change_cooldown_rounds: u64,
 }
 
 impl Default for ConsensusConfig {
@@ -232,6 +242,8 @@ impl Default for ConsensusConfig {
             view_change_timeout_ms: default_view_change_timeout_ms(),
             max_transactions_per_block: default_max_transactions_per_block(),
             max_certificates_per_block: default_max_certificates_per_block(),
+            speculative_max_txs: default_speculative_max_txs(),
+            view_change_cooldown_rounds: default_view_change_cooldown_rounds(),
         }
     }
 }
@@ -250,6 +262,14 @@ fn default_max_transactions_per_block() -> usize {
 
 fn default_max_certificates_per_block() -> usize {
     4096
+}
+
+fn default_speculative_max_txs() -> usize {
+    500 // Matches hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS
+}
+
+fn default_view_change_cooldown_rounds() -> u64 {
+    3 // Matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
 }
 
 /// Thread pool configuration.
@@ -913,7 +933,9 @@ async fn main() -> Result<()> {
         .network(network_config, p2p_identity)
         .rpc_status(rpc_node_status.clone())
         .tx_status_cache(rpc_tx_status_cache.clone())
-        .mempool_snapshot(rpc_mempool_snapshot.clone());
+        .mempool_snapshot(rpc_mempool_snapshot.clone())
+        .speculative_max_txs(config.consensus.speculative_max_txs)
+        .view_change_cooldown_rounds(config.consensus.view_change_cooldown_rounds);
 
     // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {

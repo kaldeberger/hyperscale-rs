@@ -154,6 +154,10 @@ pub struct ProductionRunnerBuilder {
     /// Radix network definition for transaction validation.
     /// Defaults to simulator network if not set.
     network_definition: Option<NetworkDefinition>,
+    /// Maximum transactions for speculative execution (in-flight + cached).
+    speculative_max_txs: usize,
+    /// Rounds to pause speculation after a view change.
+    view_change_cooldown_rounds: u64,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -179,6 +183,8 @@ impl ProductionRunnerBuilder {
             mempool_snapshot: None,
             genesis_config: None,
             network_definition: None,
+            speculative_max_txs: 500, // Default, matches hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS
+            view_change_cooldown_rounds: 3, // Default, matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
         }
     }
 
@@ -233,6 +239,24 @@ impl ProductionRunnerBuilder {
     /// Set the event channel capacity (default: 10,000).
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
+        self
+    }
+
+    /// Set the maximum transactions for speculative execution (in-flight + cached).
+    ///
+    /// Higher values allow more aggressive speculation but use more memory.
+    /// Default: 500
+    pub fn speculative_max_txs(mut self, max_txs: usize) -> Self {
+        self.speculative_max_txs = max_txs;
+        self
+    }
+
+    /// Set the number of rounds to pause speculation after a view change.
+    ///
+    /// Higher values reduce wasted work during instability but may reduce hit rate.
+    /// Default: 3
+    pub fn view_change_cooldown_rounds(mut self, rounds: u64) -> Self {
+        self.view_change_cooldown_rounds = rounds;
         self
     }
 
@@ -330,12 +354,14 @@ impl ProductionRunnerBuilder {
         let recovered = storage.load_recovered_state();
 
         // NodeIndex is a simulation concept - production uses 0
-        let state = NodeStateMachine::new(
+        let state = NodeStateMachine::with_speculative_config(
             0, // node_index not meaningful in production
             topology.clone(),
             signing_key,
             bft_config,
             recovered,
+            self.speculative_max_txs,
+            self.view_change_cooldown_rounds,
         );
         let timer_manager = TimerManager::new(timer_tx);
 
@@ -822,6 +848,22 @@ impl ProductionRunner {
                     // Update BFT metrics (view changes, round)
                     let bft_stats = self.state.bft().stats();
                     crate::metrics::set_bft_stats(&bft_stats);
+
+                    // Update speculative execution metrics
+                    let (started, hits, misses, invalidated) =
+                        self.state.execution_mut().take_speculative_metrics();
+                    if started > 0 {
+                        crate::metrics::record_speculative_execution_started(started);
+                    }
+                    for _ in 0..hits {
+                        crate::metrics::record_speculative_execution_cache_hit();
+                    }
+                    for _ in 0..misses {
+                        crate::metrics::record_speculative_execution_cache_miss();
+                    }
+                    for _ in 0..invalidated {
+                        crate::metrics::record_speculative_execution_invalidated();
+                    }
 
                     // Update mempool snapshot for RPC queries (non-blocking: skip if contended)
                     if let Some(ref snapshot) = self.mempool_snapshot {
@@ -1423,7 +1465,7 @@ impl ProductionRunner {
                             transactions
                                 .par_iter()
                                 .map(|tx| {
-                                    match executor.execute_single_shard(&*storage, &[tx.clone()]) {
+                                    match executor.execute_single_shard(&*storage, std::slice::from_ref(tx)) {
                                         Ok(output) => {
                                             if let Some(r) = output.results().first() {
                                                 hyperscale_types::ExecutionResult {
@@ -1461,6 +1503,82 @@ impl ProductionRunner {
 
                     event_tx
                         .send(Event::TransactionsExecuted {
+                            block_hash,
+                            results,
+                        })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
+                });
+            }
+
+            // Speculative execution of single-shard transactions before block commit.
+            // Uses the same execution path as ExecuteTransactions but returns a different event.
+            // Results are cached and used when the block commits (if still valid).
+            Action::SpeculativeExecute {
+                block_hash,
+                transactions,
+            } => {
+                let event_tx = self.callback_tx.clone();
+                let storage = self.storage.clone();
+                let executor = self.executor.clone();
+                let thread_pools = self.thread_pools.clone();
+
+                self.thread_pools.spawn_execution(move || {
+                    let start = std::time::Instant::now();
+                    // Execute transactions in parallel using all execution pool threads.
+                    let results: Vec<(hyperscale_types::Hash, hyperscale_types::ExecutionResult)> =
+                        thread_pools.execution_pool().install(|| {
+                            use rayon::prelude::*;
+                            transactions
+                                .par_iter()
+                                .map(|tx| {
+                                    let tx_hash = tx.hash();
+                                    let result =
+                                        match executor.execute_single_shard(&*storage, std::slice::from_ref(tx))
+                                        {
+                                            Ok(output) => {
+                                                if let Some(r) = output.results().first() {
+                                                    hyperscale_types::ExecutionResult {
+                                                        transaction_hash: r.tx_hash,
+                                                        success: r.success,
+                                                        state_root: r.outputs_merkle_root,
+                                                        writes: r.state_writes.clone(),
+                                                        error: r.error.clone(),
+                                                    }
+                                                } else {
+                                                    hyperscale_types::ExecutionResult {
+                                                        transaction_hash: tx_hash,
+                                                        success: false,
+                                                        state_root: hyperscale_types::Hash::ZERO,
+                                                        writes: vec![],
+                                                        error: Some(
+                                                            "No execution result".to_string(),
+                                                        ),
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(tx_hash = ?tx_hash, error = %e, "Speculative execution failed");
+                                                hyperscale_types::ExecutionResult {
+                                                    transaction_hash: tx_hash,
+                                                    success: false,
+                                                    state_root: hyperscale_types::Hash::ZERO,
+                                                    writes: vec![],
+                                                    error: Some(format!("{}", e)),
+                                                }
+                                            }
+                                        };
+                                    (tx_hash, result)
+                                })
+                                .collect()
+                        });
+                    crate::metrics::record_speculative_execution_latency(
+                        start.elapsed().as_secs_f64(),
+                    );
+
+                    event_tx
+                        .send(Event::SpeculativeExecutionComplete {
                             block_hash,
                             results,
                         })

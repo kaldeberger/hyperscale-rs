@@ -212,6 +212,17 @@ pub enum Event {
         results: Vec<ExecutionResult>,
     },
 
+    /// Speculative execution of single-shard transactions completed.
+    ///
+    /// Callback from `Action::SpeculativeExecute`. Results are cached and used
+    /// when the block commits, if no conflicting writes have occurred.
+    SpeculativeExecutionComplete {
+        /// Block hash where these transactions appear.
+        block_hash: Hash,
+        /// Results paired with their transaction hashes.
+        results: Vec<(Hash, ExecutionResult)>,
+    },
+
     /// Cross-shard transaction execution completed.
     ///
     /// Callback from `Action::ExecuteCrossShardTransaction`.
@@ -505,6 +516,7 @@ impl Event {
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
             | Event::TransactionsExecuted { .. }
+            | Event::SpeculativeExecutionComplete { .. }
             | Event::CrossShardTransactionExecuted { .. }
             | Event::MerkleRootComputed { .. }
             | Event::StateEntriesFetched { .. }
@@ -609,6 +621,7 @@ impl Event {
 
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",
+            Event::SpeculativeExecutionComplete { .. } => "SpeculativeExecutionComplete",
             Event::CrossShardTransactionExecuted { .. } => "CrossShardTransactionExecuted",
             Event::MerkleRootComputed { .. } => "MerkleRootComputed",
 

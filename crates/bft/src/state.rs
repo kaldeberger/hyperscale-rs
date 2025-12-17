@@ -1807,7 +1807,7 @@ impl BftState {
     #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
     pub fn on_qc_signature_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
         // Check if this is a synced block verification
-        info!(
+        debug!(
             block_hash = ?block_hash,
             pending_count = self.pending_synced_block_verifications.len(),
             pending_keys = ?self.pending_synced_block_verifications.keys().collect::<Vec<_>>(),

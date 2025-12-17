@@ -1015,7 +1015,7 @@ impl MempoolState {
             if let TransactionStatus::Committed(committed_at) = &entry.status {
                 let blocks_elapsed = current_height.0.saturating_sub(committed_at.0);
                 if blocks_elapsed >= timeout_blocks {
-                    tracing::info!(
+                    tracing::debug!(
                         tx_hash = %hash,
                         committed_at = committed_at.0,
                         current_height = current_height.0,

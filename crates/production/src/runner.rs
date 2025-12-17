@@ -934,7 +934,7 @@ impl ProductionRunner {
                             Span::current().record("actions.count", actions.len());
 
                             if !actions.is_empty() {
-                                tracing::info!(
+                                tracing::debug!(
                                     event_type = %event_type,
                                     num_actions = actions.len(),
                                     "Event produced actions"
@@ -1209,7 +1209,7 @@ impl ProductionRunner {
     }
 
     /// Process an action.
-    #[instrument(skip(self), fields(action.type = %action.type_name()))]
+    #[instrument(skip(self, action), fields(action.type = %action.type_name()))]
     async fn process_action(&mut self, action: Action) -> Result<(), RunnerError> {
         match action {
             // Network I/O - broadcast via gossipsub topics

@@ -278,7 +278,8 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
 
     # Build RUST_LOG based on log level
     # Always suppress noisy dependencies, but let hyperscale crates use the specified level
-    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=warn" "$VALIDATOR_BIN" --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+    # libp2p_gossipsub=error to suppress "duplicate message" warnings which are normal in gossip
+    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=error" "$VALIDATOR_BIN" --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
     PID=$!
     echo "$PID" >> "$PID_FILE"
     echo "    PID: $PID, logs: $LOG_FILE"

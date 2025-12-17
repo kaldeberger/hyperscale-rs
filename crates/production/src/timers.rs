@@ -51,9 +51,9 @@ impl TimerManager {
         let timer_id_for_log = id.clone();
 
         let handle = tokio::spawn(async move {
-            tracing::info!(?timer_id, ?duration, "Timer task started, sleeping");
+            tracing::trace!(?timer_id, ?duration, "Timer task started, sleeping");
             tokio::time::sleep(duration).await;
-            tracing::info!(?timer_id, "Timer fired, sending event");
+            tracing::trace!(?timer_id, "Timer fired, sending event");
             let event = timer_event(timer_id);
             if event_tx.send(event).await.is_err() {
                 // Timer ID was moved into event, use separate clone for debug

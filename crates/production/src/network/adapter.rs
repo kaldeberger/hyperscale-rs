@@ -933,7 +933,7 @@ impl Libp2pAdapter {
                 let topic = gossipsub::IdentTopic::new(topic.clone());
 
                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-                    warn!("Failed to publish message to topic {}: {:?}", topic, e);
+                    debug!("Failed to publish message to topic {}: {:?}", topic, e);
                 } else {
                     trace!("Published message to topic: {}", topic);
                 }

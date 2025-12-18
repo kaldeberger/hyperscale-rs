@@ -69,6 +69,12 @@ max_transactions_per_block = 4096
 # Maximum certificates per block
 max_certificates_per_block = 4096
 
+# Maximum transactions in mempool before rejecting RPC submissions (backpressure)
+# When the pool reaches this size, new RPC submissions return 503 Service Unavailable.
+# Gossip transactions are still accepted to allow block validation.
+# Default: 16384 (4x block size). Set to 0 for unlimited (not recommended).
+rpc_mempool_limit = 16384
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Thread Pool Configuration
 # ═══════════════════════════════════════════════════════════════════════════════

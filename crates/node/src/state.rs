@@ -4,7 +4,7 @@ use hyperscale_bft::{BftConfig, BftState, RecoveredState};
 use hyperscale_core::{Action, Event, StateMachine, SubStateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
-use hyperscale_mempool::MempoolState;
+use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_types::{Block, BlockHeight, KeyPair, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +82,7 @@ impl NodeStateMachine {
             recovered,
             hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS,
             hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
+            MempoolConfig::default(),
         )
     }
 
@@ -94,6 +95,7 @@ impl NodeStateMachine {
         recovered: RecoveredState,
         speculative_max_txs: usize,
         view_change_cooldown_rounds: u64,
+        mempool_config: MempoolConfig,
     ) -> Self {
         let local_shard = topology.local_shard();
 
@@ -113,7 +115,7 @@ impl NodeStateMachine {
                 speculative_max_txs,
                 view_change_cooldown_rounds,
             ),
-            mempool: MempoolState::new(topology.clone()),
+            mempool: MempoolState::with_config(topology.clone(), mempool_config),
             livelock: LivelockState::new(local_shard, topology),
             now: Duration::ZERO,
             last_qc_time: Duration::ZERO,

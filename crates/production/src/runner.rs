@@ -11,6 +11,7 @@ use crate::thread_pools::ThreadPoolManager;
 use crate::timers::TimerManager;
 use hyperscale_bft::BftConfig;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
+use hyperscale_mempool::MempoolConfig;
 use hyperscale_types::BlockHeight;
 
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
@@ -158,6 +159,8 @@ pub struct ProductionRunnerBuilder {
     speculative_max_txs: usize,
     /// Rounds to pause speculation after a view change.
     view_change_cooldown_rounds: u64,
+    /// Maximum transactions in mempool before rejecting RPC submissions.
+    rpc_mempool_limit: Option<usize>,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -185,6 +188,7 @@ impl ProductionRunnerBuilder {
             network_definition: None,
             speculative_max_txs: 500, // Default, matches hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS
             view_change_cooldown_rounds: 3, // Default, matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
+            rpc_mempool_limit: None,        // Use MempoolConfig::default()
         }
     }
 
@@ -257,6 +261,17 @@ impl ProductionRunnerBuilder {
     /// Default: 3
     pub fn view_change_cooldown_rounds(mut self, rounds: u64) -> Self {
         self.view_change_cooldown_rounds = rounds;
+        self
+    }
+
+    /// Set the maximum transactions in mempool before rejecting RPC submissions.
+    ///
+    /// When the pool reaches this size, new RPC submissions return 503 Service Unavailable.
+    /// Gossip transactions are still accepted to allow block validation.
+    /// Set to 0 for unlimited (not recommended).
+    /// Default: 16,384 (4x block size)
+    pub fn rpc_mempool_limit(mut self, limit: usize) -> Self {
+        self.rpc_mempool_limit = if limit == 0 { None } else { Some(limit) };
         self
     }
 
@@ -353,6 +368,12 @@ impl ProductionRunnerBuilder {
         // Load RecoveredState from storage for crash recovery
         let recovered = storage.load_recovered_state();
 
+        // Build mempool config
+        let mempool_config = match self.rpc_mempool_limit {
+            Some(limit) => MempoolConfig::new().with_max_rpc_pool_size(Some(limit)),
+            None => MempoolConfig::default(),
+        };
+
         // NodeIndex is a simulation concept - production uses 0
         let state = NodeStateMachine::with_speculative_config(
             0, // node_index not meaningful in production
@@ -362,6 +383,7 @@ impl ProductionRunnerBuilder {
             recovered,
             self.speculative_max_txs,
             self.view_change_cooldown_rounds,
+            mempool_config,
         );
         let timer_manager = TimerManager::new(timer_tx);
 
@@ -869,6 +891,8 @@ impl ProductionRunner {
                     if let Some(ref snapshot) = self.mempool_snapshot {
                         let stats = self.state.mempool().lock_contention_stats();
                         let total = self.state.mempool().len();
+                        let accepting = self.state.mempool().is_accepting_rpc_transactions();
+                        let max_size = self.state.mempool().max_rpc_pool_size();
 
                         // Update Prometheus metrics
                         crate::metrics::set_mempool_size(total);
@@ -881,6 +905,8 @@ impl ProductionRunner {
                             snap.blocked_count = stats.blocked_count as usize;
                             snap.total_count = total;
                             snap.updated_at = Some(std::time::Instant::now());
+                            snap.accepting_rpc_transactions = accepting;
+                            snap.max_rpc_pool_size = max_size;
                         }
                     }
                 }

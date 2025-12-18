@@ -131,10 +131,31 @@ pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
 ///
 /// This matches Ethereum behavior where `eth_sendRawTransaction` returns the
 /// transaction hash immediately, and invalid transactions simply never get mined.
+///
+/// Returns 503 Service Unavailable if the mempool is full (backpressure).
 pub async fn submit_transaction_handler(
     State(state): State<RpcState>,
     Json(request): Json<SubmitTransactionRequest>,
 ) -> impl IntoResponse {
+    // Check mempool capacity first (backpressure)
+    {
+        let snapshot = state.mempool_snapshot.read().await;
+        if !snapshot.accepting_rpc_transactions {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(SubmitTransactionResponse {
+                    accepted: false,
+                    hash: String::new(),
+                    error: Some(format!(
+                        "Mempool full ({}/{} transactions). Try again later.",
+                        snapshot.total_count,
+                        snapshot.max_rpc_pool_size.unwrap_or(0)
+                    )),
+                }),
+            );
+        }
+    }
+
     // Decode hex - structural validation, return error immediately
     let tx_bytes = match hex::decode(&request.transaction_hex) {
         Ok(bytes) => bytes,

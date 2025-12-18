@@ -149,7 +149,7 @@ impl TransactionStatusCache {
 /// Snapshot of mempool state for RPC queries.
 ///
 /// Updated periodically by the runner from the mempool state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MempoolSnapshot {
     /// Number of pending transactions (waiting to be included in a block).
     pub pending_count: usize,
@@ -163,6 +163,32 @@ pub struct MempoolSnapshot {
     pub blocked_count: usize,
     /// When this snapshot was taken.
     pub updated_at: Option<Instant>,
+    /// Whether the mempool is accepting new RPC transactions.
+    ///
+    /// When `false`, the mempool has reached its `max_rpc_pool_size` and
+    /// new RPC submissions should be rejected with a "mempool full" response.
+    /// This provides backpressure to clients.
+    ///
+    /// Defaults to `true` so that transactions can be accepted before the first
+    /// snapshot update from the runner.
+    pub accepting_rpc_transactions: bool,
+    /// Maximum RPC pool size, if configured.
+    pub max_rpc_pool_size: Option<usize>,
+}
+
+impl Default for MempoolSnapshot {
+    fn default() -> Self {
+        Self {
+            pending_count: 0,
+            committed_count: 0,
+            executed_count: 0,
+            total_count: 0,
+            blocked_count: 0,
+            updated_at: None,
+            accepting_rpc_transactions: true, // Default to accepting until we know otherwise
+            max_rpc_pool_size: None,
+        }
+    }
 }
 
 /// Mutable node status state updated by the runner.

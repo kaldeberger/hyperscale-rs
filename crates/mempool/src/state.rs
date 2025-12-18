@@ -10,6 +10,56 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
+/// Default RPC mempool limit: 4x block size.
+///
+/// This provides enough buffer for a few blocks worth of transactions while
+/// keeping the pool small enough for efficient state lock checking.
+pub const DEFAULT_RPC_MEMPOOL_LIMIT: usize = 4096 * 4; // 16,384 transactions
+
+/// Mempool configuration.
+#[derive(Debug, Clone)]
+pub struct MempoolConfig {
+    /// Maximum number of transactions in the pool before rejecting RPC submissions.
+    ///
+    /// When the pool reaches this size, new transactions submitted via RPC will be
+    /// rejected with a "mempool full" response. This provides backpressure to clients.
+    ///
+    /// Note: Transactions received via gossip are still accepted even when over this
+    /// limit, because other nodes may propose blocks containing those transactions.
+    /// We need them in our mempool to validate and vote on those blocks.
+    ///
+    /// Set to `None` for unlimited (not recommended for production).
+    pub max_rpc_pool_size: Option<usize>,
+}
+
+impl Default for MempoolConfig {
+    fn default() -> Self {
+        Self {
+            max_rpc_pool_size: Some(DEFAULT_RPC_MEMPOOL_LIMIT),
+        }
+    }
+}
+
+impl MempoolConfig {
+    /// Create a new config with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the maximum RPC pool size.
+    pub fn with_max_rpc_pool_size(mut self, max: Option<usize>) -> Self {
+        self.max_rpc_pool_size = max;
+        self
+    }
+
+    /// Create a config with no RPC pool size limit (for testing).
+    pub fn unlimited() -> Self {
+        Self {
+            max_rpc_pool_size: None,
+        }
+    }
+}
+
 /// Lock contention statistics from the mempool.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LockContentionStats {
@@ -105,11 +155,19 @@ pub struct MempoolState {
 
     /// Current committed block height (for retry transaction creation).
     current_height: BlockHeight,
+
+    /// Configuration for mempool behavior.
+    config: MempoolConfig,
 }
 
 impl MempoolState {
-    /// Create a new mempool state machine.
+    /// Create a new mempool state machine with default config.
     pub fn new(topology: Arc<dyn Topology>) -> Self {
+        Self::with_config(topology, MempoolConfig::default())
+    }
+
+    /// Create a new mempool state machine with custom config.
+    pub fn with_config(topology: Arc<dyn Topology>, config: MempoolConfig) -> Self {
         Self {
             pool: BTreeMap::new(),
             blocked_by: HashMap::new(),
@@ -122,6 +180,7 @@ impl MempoolState {
             now: Duration::ZERO,
             topology,
             current_height: BlockHeight(0),
+            config,
         }
     }
 
@@ -962,6 +1021,25 @@ impl MempoolState {
     /// Check if the pool is empty.
     pub fn is_empty(&self) -> bool {
         self.pool.is_empty()
+    }
+
+    /// Check if the mempool is accepting new RPC transactions.
+    ///
+    /// Returns `false` if the pool has reached `max_rpc_pool_size`, meaning
+    /// new RPC submissions should be rejected with backpressure.
+    ///
+    /// Note: This does NOT affect gossip transactions, which are always accepted
+    /// because other nodes may propose blocks containing them.
+    pub fn is_accepting_rpc_transactions(&self) -> bool {
+        match self.config.max_rpc_pool_size {
+            Some(max) => self.pool.len() < max,
+            None => true,
+        }
+    }
+
+    /// Get the maximum RPC pool size, if configured.
+    pub fn max_rpc_pool_size(&self) -> Option<usize> {
+        self.config.max_rpc_pool_size
     }
 
     /// Get all incomplete transactions (not yet finalized or completed).
@@ -1911,5 +1989,75 @@ mod tests {
         // Should reject gossip
         let actions = mempool.on_transaction_gossip(tx);
         assert!(actions.is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RPC Backpressure Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_is_accepting_rpc_transactions_default() {
+        let mempool = MempoolState::new(make_test_topology());
+        // Default config has DEFAULT_RPC_MEMPOOL_LIMIT, empty pool should accept
+        assert!(mempool.is_accepting_rpc_transactions());
+        assert_eq!(mempool.max_rpc_pool_size(), Some(DEFAULT_RPC_MEMPOOL_LIMIT));
+    }
+
+    #[test]
+    fn test_is_accepting_rpc_transactions_unlimited() {
+        let config = MempoolConfig::unlimited();
+        let mempool = MempoolState::with_config(make_test_topology(), config);
+        assert!(mempool.is_accepting_rpc_transactions());
+        assert!(mempool.max_rpc_pool_size().is_none());
+    }
+
+    #[test]
+    fn test_is_accepting_rpc_transactions_at_limit() {
+        // Create config with very small limit
+        let config = MempoolConfig::new().with_max_rpc_pool_size(Some(3));
+        let mut mempool = MempoolState::with_config(make_test_topology(), config);
+
+        // Add 2 transactions - should still accept
+        mempool.on_submit_transaction(test_transaction(1));
+        mempool.on_submit_transaction(test_transaction(2));
+        assert!(mempool.is_accepting_rpc_transactions());
+        assert_eq!(mempool.len(), 2);
+
+        // Add 3rd transaction - now at limit, should NOT accept more
+        mempool.on_submit_transaction(test_transaction(3));
+        assert!(!mempool.is_accepting_rpc_transactions());
+        assert_eq!(mempool.len(), 3);
+    }
+
+    #[test]
+    fn test_gossip_accepted_even_when_full() {
+        // Create config with very small limit
+        let config = MempoolConfig::new().with_max_rpc_pool_size(Some(2));
+        let mut mempool = MempoolState::with_config(make_test_topology(), config);
+
+        // Fill the pool to the limit
+        mempool.on_submit_transaction(test_transaction(1));
+        mempool.on_submit_transaction(test_transaction(2));
+        assert!(!mempool.is_accepting_rpc_transactions());
+
+        // Gossip should STILL be accepted (we need txs for block validation)
+        let tx3 = test_transaction(3);
+        let tx3_hash = tx3.hash();
+        let actions = mempool.on_transaction_gossip(tx3);
+
+        // Gossip doesn't emit actions (no status emission for gossip)
+        assert!(actions.is_empty());
+        // But the transaction should be in the pool
+        assert!(mempool.has_transaction(&tx3_hash));
+        assert_eq!(mempool.len(), 3);
+    }
+
+    #[test]
+    fn test_config_builder() {
+        let config = MempoolConfig::new().with_max_rpc_pool_size(Some(50_000));
+        assert_eq!(config.max_rpc_pool_size, Some(50_000));
+
+        let config_none = MempoolConfig::new().with_max_rpc_pool_size(None);
+        assert_eq!(config_none.max_rpc_pool_size, None);
     }
 }

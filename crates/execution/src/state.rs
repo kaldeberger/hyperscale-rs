@@ -1255,7 +1255,12 @@ impl ExecutionState {
         tracker.add_vote(vote, voting_power);
 
         // Check for quorum
-        if let Some((merkle_root, votes, total_power)) = tracker.check_quorum() {
+        if let Some((merkle_root, total_power)) = tracker.check_quorum() {
+            // Extract data from tracker - use take_votes_for_root to avoid cloning
+            let votes = tracker.take_votes_for_root(&merkle_root);
+            let read_nodes = tracker.read_nodes().to_vec();
+            let participating_shards = tracker.participating_shards().to_vec();
+
             tracing::debug!(
                 tx_hash = ?tx_hash,
                 shard = local_shard.0,
@@ -1264,10 +1269,6 @@ impl ExecutionState {
                 power = total_power,
                 "Vote quorum reached"
             );
-
-            // Extract data from tracker before releasing borrow
-            let read_nodes = tracker.read_nodes().to_vec();
-            let participating_shards = tracker.participating_shards().to_vec();
 
             // Create state certificate
             let certificate =

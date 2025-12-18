@@ -76,16 +76,28 @@ impl VoteTracker {
 
     /// Check if quorum is reached for any merkle root.
     ///
-    /// Returns `Some((merkle_root, matching_votes, total_power))` if quorum
-    /// is reached, `None` otherwise.
-    pub fn check_quorum(&self) -> Option<(Hash, Vec<StateVoteBlock>, u64)> {
+    /// Returns `Some((merkle_root, total_power))` if quorum is reached, `None` otherwise.
+    /// Use `votes_for_root()` to get the actual votes after checking quorum.
+    pub fn check_quorum(&self) -> Option<(Hash, u64)> {
         for (merkle_root, power) in &self.power_by_root {
             if *power >= self.quorum {
-                let votes = self.votes_by_root[merkle_root].clone();
-                return Some((*merkle_root, votes, *power));
+                return Some((*merkle_root, *power));
             }
         }
         None
+    }
+
+    /// Get votes for a specific merkle root (reference).
+    pub fn votes_for_root(&self, merkle_root: &Hash) -> &[StateVoteBlock] {
+        self.votes_by_root
+            .get(merkle_root)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Take votes for a specific merkle root (ownership transfer, avoids clone).
+    pub fn take_votes_for_root(&mut self, merkle_root: &Hash) -> Vec<StateVoteBlock> {
+        self.votes_by_root.remove(merkle_root).unwrap_or_default()
     }
 
     /// Get the quorum needed for this tracker.
@@ -137,9 +149,9 @@ mod tests {
         // Now quorum
         let result = tracker.check_quorum();
         assert!(result.is_some());
-        let (root, votes, power) = result.unwrap();
+        let (root, power) = result.unwrap();
         assert_eq!(root, merkle_root);
-        assert_eq!(votes.len(), 3);
+        assert_eq!(tracker.votes_for_root(&root).len(), 3);
         assert_eq!(power, 3);
     }
 
@@ -179,7 +191,7 @@ mod tests {
         tracker.add_vote(vote_a.clone(), 1);
         let result = tracker.check_quorum();
         assert!(result.is_some());
-        let (root, _, _) = result.unwrap();
+        let (root, _power) = result.unwrap();
         assert_eq!(root, root_a);
     }
 }

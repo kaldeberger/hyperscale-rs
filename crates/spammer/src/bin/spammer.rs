@@ -257,7 +257,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *latency_poll_interval
                 );
             }
-            let report = spammer.run_for(*duration).await;
+
+            // Set up graceful shutdown on Ctrl+C
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_for_signal = cancel.clone();
+            let cancel_for_timeout = cancel.clone();
+
+            // Spawn task to cancel on Ctrl+C
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    println!("\nReceived Ctrl+C, shutting down gracefully...");
+                    cancel_for_signal.cancel();
+                }
+            });
+
+            // Spawn task to cancel after duration
+            let duration_val = *duration;
+            tokio::spawn(async move {
+                tokio::time::sleep(duration_val).await;
+                cancel_for_timeout.cancel();
+            });
+
+            // Run until cancelled (by either Ctrl+C or timeout)
+            let report = spammer.run_until_cancelled(cancel).await;
             report.print();
         }
 

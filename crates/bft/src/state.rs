@@ -2607,7 +2607,7 @@ impl BftState {
         if latest_qc_height < height {
             // No QC formed at current height - safe to unlock
             let had_vote = self.voted_heights.remove(&height).is_some();
-            let cleared_votes = self.clear_vote_tracking_for_height(height);
+            let cleared_votes = self.clear_vote_tracking_for_height(height, self.view);
 
             if had_vote || cleared_votes > 0 {
                 info!(
@@ -3279,8 +3279,15 @@ impl BftState {
     /// to vote again after a view change proves no QC formed. This is safe because
     /// the view change certificate provides proof that consensus has moved on.
     ///
+    /// The `new_round` parameter is used to selectively clear pending vote verifications:
+    /// only verifications for votes at rounds LESS than the new round are cleared.
+    /// This prevents a race condition where:
+    /// 1. We receive a vote from another validator at round N
+    /// 2. Before verification completes, we advance to round N
+    /// 3. If we cleared ALL verifications, we'd lose the valid vote at round N
+    ///
     /// Returns the number of vote entries cleared.
-    fn clear_vote_tracking_for_height(&mut self, height: u64) -> usize {
+    fn clear_vote_tracking_for_height(&mut self, height: u64, new_round: u64) -> usize {
         let mut cleared = 0;
 
         // Clear received_votes_by_height for this height
@@ -3299,17 +3306,26 @@ impl BftState {
         self.vote_sets
             .retain(|_hash, vote_set| vote_set.height().is_none_or(|h| h != height));
 
-        // Clear pending vote verifications for this height.
-        // This prevents the crypto pool from being overwhelmed with stale verifications
-        // after a view change - verifying votes for heights we've moved past is wasted work.
+        // Clear pending vote verifications for this height, but ONLY for rounds
+        // less than the new round. Votes at the current or higher rounds are still
+        // valid and should complete verification.
+        //
+        // This fixes a race condition: if another validator creates a fallback block
+        // at round N and sends us a vote, we might receive and start verifying it
+        // just before our own timer fires and advances us to round N. Without this
+        // round check, we'd discard the valid vote and never form a QC.
         let before_pending = self.pending_vote_verifications.len();
-        self.pending_vote_verifications
-            .retain(|_, pending| pending.vote.height.0 != height);
+        self.pending_vote_verifications.retain(|_, pending| {
+            // Keep if: different height OR round >= new_round
+            pending.vote.height.0 != height || pending.vote.round >= new_round
+        });
         let pending_cleared = before_pending - self.pending_vote_verifications.len();
         if pending_cleared > 0 {
             debug!(
                 height,
-                pending_cleared, "Cleared pending vote verifications for height during view change"
+                new_round,
+                pending_cleared,
+                "Cleared pending vote verifications for height during view change"
             );
         }
 
@@ -5766,8 +5782,8 @@ mod tests {
             .received_votes_by_height
             .insert((6, ValidatorId(0)), (Hash::from_bytes(b"block_c"), 0));
 
-        // Clear tracking for height 5
-        let cleared = state.clear_vote_tracking_for_height(height);
+        // Clear tracking for height 5, advancing to round 2
+        let cleared = state.clear_vote_tracking_for_height(height, 2);
 
         assert_eq!(cleared, 3, "Should clear 3 entries at height 5");
         assert!(
@@ -5781,6 +5797,128 @@ mod tests {
                 .received_votes_by_height
                 .contains_key(&(6, ValidatorId(0))),
             "Height 6 entries should remain"
+        );
+    }
+
+    #[test]
+    fn test_clear_vote_tracking_preserves_current_round_votes() {
+        // Test that pending vote verifications at the current/higher round are preserved.
+        // This is critical to prevent the race condition where we discard valid votes.
+        let (mut state, keys) = make_multi_validator_state();
+
+        let height = 5u64;
+        let block_hash = Hash::from_bytes(b"test_block");
+
+        // Add pending vote verifications at different rounds
+        // Round 1 - should be cleared when advancing to round 2
+        state.pending_vote_verifications.insert(
+            (block_hash, ValidatorId(0)),
+            PendingVoteVerification {
+                vote: BlockVote {
+                    block_hash,
+                    height: BlockHeight(height),
+                    round: 1,
+                    voter: ValidatorId(0),
+                    signature: keys[0].sign(block_hash.as_bytes()),
+                    timestamp: 100_000,
+                },
+                voting_power: 1,
+                committee_index: 0,
+            },
+        );
+
+        // Round 2 - should be preserved when advancing to round 2
+        state.pending_vote_verifications.insert(
+            (block_hash, ValidatorId(1)),
+            PendingVoteVerification {
+                vote: BlockVote {
+                    block_hash,
+                    height: BlockHeight(height),
+                    round: 2,
+                    voter: ValidatorId(1),
+                    signature: keys[1].sign(block_hash.as_bytes()),
+                    timestamp: 100_001,
+                },
+                voting_power: 1,
+                committee_index: 1,
+            },
+        );
+
+        // Round 3 - should be preserved when advancing to round 2
+        state.pending_vote_verifications.insert(
+            (block_hash, ValidatorId(2)),
+            PendingVoteVerification {
+                vote: BlockVote {
+                    block_hash,
+                    height: BlockHeight(height),
+                    round: 3,
+                    voter: ValidatorId(2),
+                    signature: keys[2].sign(block_hash.as_bytes()),
+                    timestamp: 100_002,
+                },
+                voting_power: 1,
+                committee_index: 2,
+            },
+        );
+
+        // Different height - should be preserved regardless of round
+        state.pending_vote_verifications.insert(
+            (block_hash, ValidatorId(3)),
+            PendingVoteVerification {
+                vote: BlockVote {
+                    block_hash,
+                    height: BlockHeight(6), // Different height
+                    round: 0,
+                    voter: ValidatorId(3),
+                    signature: keys[3].sign(block_hash.as_bytes()),
+                    timestamp: 100_003,
+                },
+                voting_power: 1,
+                committee_index: 3,
+            },
+        );
+
+        assert_eq!(state.pending_vote_verifications.len(), 4);
+
+        // Clear tracking for height 5, advancing to round 2
+        state.clear_vote_tracking_for_height(height, 2);
+
+        // Round 1 vote should be cleared (round < new_round)
+        assert!(
+            !state
+                .pending_vote_verifications
+                .contains_key(&(block_hash, ValidatorId(0))),
+            "Round 1 vote should be cleared"
+        );
+
+        // Round 2 vote should be preserved (round >= new_round)
+        assert!(
+            state
+                .pending_vote_verifications
+                .contains_key(&(block_hash, ValidatorId(1))),
+            "Round 2 vote should be preserved"
+        );
+
+        // Round 3 vote should be preserved (round >= new_round)
+        assert!(
+            state
+                .pending_vote_verifications
+                .contains_key(&(block_hash, ValidatorId(2))),
+            "Round 3 vote should be preserved"
+        );
+
+        // Different height vote should be preserved
+        assert!(
+            state
+                .pending_vote_verifications
+                .contains_key(&(block_hash, ValidatorId(3))),
+            "Different height vote should be preserved"
+        );
+
+        assert_eq!(
+            state.pending_vote_verifications.len(),
+            3,
+            "Should have 3 remaining verifications"
         );
     }
 

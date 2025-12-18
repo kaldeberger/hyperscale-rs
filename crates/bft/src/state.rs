@@ -3053,7 +3053,68 @@ impl BftState {
     /// Called when the runner gives up on fetching transactions/certificates
     /// after max retries. We remove the pending block and any associated buffered
     /// commit to allow sync to be triggered.
+    ///
+    /// IMPORTANT: If a QC has been formed for this block, we MUST NOT give up.
+    /// The block is committed in the consensus view and we need its data to make
+    /// progress. In this case, we restart the fetch instead of removing the block.
+    ///
+    /// TODO: This is a quick fix for a data availability issue. We need to think
+    /// more carefully about DA guarantees:
+    /// - Should we require complete block data before voting?
+    /// - Should proposers persist block data before broadcasting?
+    /// - How do we handle the case where the proposer is the only one with the data
+    ///   and they crash/disappear?
     pub fn on_fetch_failed(&mut self, block_hash: Hash) -> Vec<Action> {
+        // Check if this block has a QC - if so, we MUST get the data eventually
+        let has_qc = self.certified_blocks.contains_key(&block_hash)
+            || self
+                .latest_qc
+                .as_ref()
+                .map(|qc| qc.block_hash == block_hash)
+                .unwrap_or(false);
+
+        if has_qc {
+            // Block has a QC - we cannot give up on fetching its data
+            if let Some(pending) = self.pending_blocks.get(&block_hash) {
+                let height = pending.header().height.0;
+                let proposer = pending.header().proposer;
+                let missing_txs: Vec<Hash> = pending.missing_transactions();
+                let missing_certs: Vec<Hash> = pending.missing_certificates();
+
+                warn!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?block_hash,
+                    height = height,
+                    missing_txs = missing_txs.len(),
+                    missing_certs = missing_certs.len(),
+                    "Fetch failed but block has QC - must retry (block is committed in consensus)"
+                );
+
+                let mut actions = Vec::new();
+
+                // Restart transaction fetch if needed
+                if !missing_txs.is_empty() {
+                    actions.push(Action::FetchTransactions {
+                        block_hash,
+                        proposer,
+                        tx_hashes: missing_txs,
+                    });
+                }
+
+                // Restart certificate fetch if needed
+                if !missing_certs.is_empty() {
+                    actions.push(Action::FetchCertificates {
+                        block_hash,
+                        proposer,
+                        cert_hashes: missing_certs,
+                    });
+                }
+
+                return actions;
+            }
+        }
+
+        // No QC for this block - safe to give up and let sync handle it
         if let Some(pending) = self.pending_blocks.remove(&block_hash) {
             let height = pending.header().height.0;
             warn!(

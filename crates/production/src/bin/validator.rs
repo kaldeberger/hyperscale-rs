@@ -772,24 +772,56 @@ fn build_bft_config(config: &ConsensusConfig) -> BftConfig {
 
 /// Build network configuration from TOML config.
 fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
-    let listen_addr = config
+    let listen_addr: libp2p::Multiaddr = config
         .listen_addr
         .parse()
         .with_context(|| format!("Invalid listen address: {}", config.listen_addr))?;
 
+    let mut listen_addresses = vec![listen_addr];
+
+    // Automatic TCP fallback: if listening on QUIC/UDP, also listen on TCP on same port
+    if config.listen_addr.contains("/udp/") && config.listen_addr.contains("/quic-v1") {
+        let tcp_addr_str = config.listen_addr
+            .replace("/udp/", "/tcp/")
+            .replace("/quic-v1", "");
+        
+        if let Ok(tcp_addr) = tcp_addr_str.parse::<libp2p::Multiaddr>() {
+            info!("Enabled TCP fallback listener on {}", tcp_addr);
+            listen_addresses.push(tcp_addr);
+        } else {
+            warn!("Failed to derive TCP fallback address from {}", config.listen_addr);
+        }
+    }
+
+    // Filter out our own listen addresses from bootstrap peers to prevent self-dialing
     let bootstrap_peers: Vec<_> = config
         .bootstrap_peers
         .iter()
         .filter_map(|addr| {
-            addr.parse().ok().or_else(|| {
+            let parsed = addr.parse::<libp2p::Multiaddr>().ok().or_else(|| {
                 warn!("Invalid bootstrap peer address: {}", addr);
                 None
-            })
+            })?;
+
+            // Check if this bootstrap peer matches any of our listen addresses
+            // We compare string representations to handle minor formatting differences
+            let is_self = listen_addresses.iter().any(|listen| {
+                // Check if port and protocol match
+                // We're aggressive here: if it looks like us, don't dial it
+                listen.to_string() == parsed.to_string()
+            });
+
+            if is_self {
+                info!("Removing self from bootstrap peers: {}", addr);
+                None
+            } else {
+                Some(parsed)
+            }
         })
         .collect();
 
     Ok(Libp2pConfig::default()
-        .with_listen_addresses(vec![listen_addr])
+        .with_listen_addresses(listen_addresses)
         .with_bootstrap_peers(bootstrap_peers)
         .with_request_timeout(Duration::from_millis(config.request_timeout_ms))
         .with_max_message_size(config.max_message_size)

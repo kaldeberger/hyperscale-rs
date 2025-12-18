@@ -294,6 +294,9 @@ struct Behaviour {
 
     /// Request-response for sync block fetching.
     request_response: request_response::Behaviour<HyperscaleCodec>,
+
+    /// Connection limits to prevent storms.
+    limits: libp2p::connection_limits::Behaviour,
 }
 
 /// libp2p-based network adapter for production use.
@@ -430,20 +433,45 @@ impl Libp2pAdapter {
         let request_response =
             request_response::Behaviour::with_codec(HyperscaleCodec, protocols, req_resp_config);
 
+        // Connection limits
+        let limits = libp2p::connection_limits::Behaviour::new(
+            libp2p::connection_limits::ConnectionLimits::default()
+                .with_max_pending_incoming(Some(10))
+                .with_max_pending_outgoing(Some(10))
+                .with_max_established_incoming(Some(100))
+                .with_max_established_outgoing(Some(100))
+                .with_max_established_per_peer(Some(2)),
+        );
+
         // Create behaviour
         let behaviour = Behaviour {
             gossipsub,
             kademlia,
             request_response,
+            limits,
         };
 
         // Build swarm
+        // Build swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                || {
+                    let mut config = libp2p::yamux::Config::default();
+                    config.set_max_num_streams(256);
+                    config
+                },
+            )
+            .map_err(|e| NetworkError::NetworkError(e.to_string()))?
             .with_quic()
             .with_behaviour(|_| behaviour)
             .map_err(|e| NetworkError::NetworkError(e.to_string()))?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(config.idle_connection_timeout))
+            .with_swarm_config(|c| {
+                c.with_idle_connection_timeout(config.idle_connection_timeout)
+                    .with_max_negotiating_inbound_streams(100)
+            })
             .build();
 
         // Listen on configured addresses

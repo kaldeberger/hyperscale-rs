@@ -198,6 +198,8 @@ pub enum Action {
         status: TransactionStatus,
         /// When the transaction was added to the mempool (for latency tracking).
         added_at: Duration,
+        /// Whether this is a cross-shard transaction (for metrics labeling).
+        cross_shard: bool,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

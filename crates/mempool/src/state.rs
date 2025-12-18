@@ -94,6 +94,8 @@ struct PoolEntry {
     tx: Arc<RoutableTransaction>,
     status: TransactionStatus,
     added_at: Duration,
+    /// Whether this is a cross-shard transaction (cached at insertion time).
+    cross_shard: bool,
 }
 
 /// Mempool state machine.
@@ -195,6 +197,7 @@ impl MempoolState {
                 tx_hash: hash,
                 status: TransactionStatus::Pending, // Already exists
                 added_at: entry.added_at,
+                cross_shard: entry.cross_shard,
             }];
         }
 
@@ -204,12 +207,14 @@ impl MempoolState {
             return vec![];
         }
 
+        let cross_shard = tx.is_cross_shard(self.topology.num_shards());
         self.pool.insert(
             hash,
             PoolEntry {
                 tx: Arc::clone(&tx),
                 status: TransactionStatus::Pending,
                 added_at: self.now,
+                cross_shard,
             },
         );
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
@@ -220,6 +225,7 @@ impl MempoolState {
             tx_hash: hash,
             status: TransactionStatus::Pending,
             added_at: self.now,
+            cross_shard,
         }]
     }
 
@@ -239,12 +245,14 @@ impl MempoolState {
             return vec![];
         }
 
+        let cross_shard = tx.is_cross_shard(self.topology.num_shards());
         self.pool.insert(
             hash,
             PoolEntry {
                 tx,
                 status: TransactionStatus::Pending,
                 added_at: self.now,
+                cross_shard,
             },
         );
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
@@ -330,12 +338,14 @@ impl MempoolState {
         for tx in &block.transactions {
             let hash = tx.hash();
             if !self.pool.contains_key(&hash) {
+                let cross_shard = tx.is_cross_shard(self.topology.num_shards());
                 self.pool.insert(
                     hash,
                     PoolEntry {
                         tx: Arc::clone(tx),
                         status: TransactionStatus::Pending, // Will be updated by execution
                         added_at: self.now,
+                        cross_shard,
                     },
                 );
                 tracing::debug!(
@@ -373,6 +383,7 @@ impl MempoolState {
                 // Only update if still Pending (avoid overwriting later states during sync)
                 if matches!(entry.status, TransactionStatus::Pending) {
                     let added_at = entry.added_at;
+                    let cross_shard = entry.cross_shard;
                     entry.status = TransactionStatus::Committed(height);
                     // Add locks for committed transactions
                     self.add_locked_nodes(tx);
@@ -380,6 +391,7 @@ impl MempoolState {
                         tx_hash: hash,
                         status: TransactionStatus::Committed(height),
                         added_at,
+                        cross_shard,
                     });
                 }
             }
@@ -403,6 +415,7 @@ impl MempoolState {
         for abort in &block.aborted {
             if let Some(entry) = self.pool.get(&abort.tx_hash) {
                 let added_at = entry.added_at;
+                let cross_shard = entry.cross_shard;
                 let status = TransactionStatus::Aborted {
                     reason: abort.reason.clone(),
                 };
@@ -410,6 +423,7 @@ impl MempoolState {
                     tx_hash: abort.tx_hash,
                     status,
                     added_at,
+                    cross_shard,
                 });
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(abort.tx_hash);
@@ -476,6 +490,7 @@ impl MempoolState {
                     from = %entry.status,
                     "Transaction deferred due to livelock cycle"
                 );
+                let cross_shard = entry.cross_shard;
                 entry.status = new_status.clone();
 
                 // Track for retry when winner completes
@@ -492,6 +507,7 @@ impl MempoolState {
                     tx_hash,
                     status: new_status,
                     added_at: entry.added_at,
+                    cross_shard,
                 }];
             }
         } else {
@@ -532,10 +548,12 @@ impl MempoolState {
         // Mark the certificate's TX as completed with the final decision and evict
         if let Some(entry) = self.pool.get(&tx_hash) {
             let added_at = entry.added_at;
+            let cross_shard = entry.cross_shard;
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Completed(decision),
                 added_at,
+                cross_shard,
             });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(tx_hash);
@@ -568,10 +586,12 @@ impl MempoolState {
                 // Update original's status to Retried and evict
                 if let Some(entry) = self.pool.get(&loser_hash) {
                     let added_at = entry.added_at;
+                    let cross_shard = entry.cross_shard;
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: loser_hash,
                         status: TransactionStatus::Retried { new_tx: retry_hash },
                         added_at,
+                        cross_shard,
                     });
                     // Evict from pool and tombstone - terminal state
                     self.evict_terminal(loser_hash);
@@ -580,12 +600,14 @@ impl MempoolState {
                 // Add retry to mempool if not already present (dedup by hash)
                 if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
                     let retry_tx = Arc::new(retry_tx);
+                    let cross_shard = retry_tx.is_cross_shard(self.topology.num_shards());
                     self.pool.insert(
                         retry_hash,
                         PoolEntry {
                             tx: Arc::clone(&retry_tx),
                             status: TransactionStatus::Pending,
                             added_at: self.now,
+                            cross_shard,
                         },
                     );
 
@@ -594,6 +616,7 @@ impl MempoolState {
                         tx_hash: retry_hash,
                         status: TransactionStatus::Pending,
                         added_at: self.now,
+                        cross_shard,
                     });
 
                     // Gossip the retry to relevant shards
@@ -648,10 +671,12 @@ impl MempoolState {
         // Update original's status to Retried and evict
         if let Some(entry) = self.pool.get(&loser_hash) {
             let added_at = entry.added_at;
+            let cross_shard = entry.cross_shard;
             actions.push(Action::EmitTransactionStatus {
                 tx_hash: loser_hash,
                 status: TransactionStatus::Retried { new_tx: retry_hash },
                 added_at,
+                cross_shard,
             });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(loser_hash);
@@ -660,12 +685,14 @@ impl MempoolState {
         // Add retry to mempool if not already present (dedup by hash)
         if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
             let retry_tx = Arc::new(retry_tx);
+            let cross_shard = retry_tx.is_cross_shard(self.topology.num_shards());
             self.pool.insert(
                 retry_hash,
                 PoolEntry {
                     tx: Arc::clone(&retry_tx),
                     status: TransactionStatus::Pending,
                     added_at: self.now,
+                    cross_shard,
                 },
             );
 
@@ -674,6 +701,7 @@ impl MempoolState {
                 tx_hash: retry_hash,
                 status: TransactionStatus::Pending,
                 added_at: self.now,
+                cross_shard,
             });
 
             // Gossip the retry to relevant shards
@@ -721,11 +749,13 @@ impl MempoolState {
                 TransactionDecision::Reject
             };
             let added_at = entry.added_at;
+            let cross_shard = entry.cross_shard;
             entry.status = TransactionStatus::Executed(decision);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Executed(decision),
                 added_at,
+                cross_shard,
             });
         }
 
@@ -759,10 +789,12 @@ impl MempoolState {
             // Update original's status to Retried and evict
             if let Some(entry) = self.pool.get(&loser_hash) {
                 let added_at = entry.added_at;
+                let cross_shard = entry.cross_shard;
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: loser_hash,
                     status: TransactionStatus::Retried { new_tx: retry_hash },
                     added_at,
+                    cross_shard,
                 });
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(loser_hash);
@@ -771,12 +803,14 @@ impl MempoolState {
             // Add retry to mempool if not already present (dedup by hash)
             if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
                 let retry_tx = Arc::new(retry_tx);
+                let cross_shard = retry_tx.is_cross_shard(self.topology.num_shards());
                 self.pool.insert(
                     retry_hash,
                     PoolEntry {
                         tx: Arc::clone(&retry_tx),
                         status: TransactionStatus::Pending,
                         added_at: self.now,
+                        cross_shard,
                     },
                 );
 
@@ -785,6 +819,7 @@ impl MempoolState {
                     tx_hash: retry_hash,
                     status: TransactionStatus::Pending,
                     added_at: self.now,
+                    cross_shard,
                 });
 
                 // Gossip the retry to relevant shards
@@ -801,12 +836,14 @@ impl MempoolState {
     pub fn mark_completed(&mut self, tx_hash: &Hash, decision: TransactionDecision) -> Vec<Action> {
         if let Some(entry) = self.pool.get(tx_hash) {
             let added_at = entry.added_at;
+            let cross_shard = entry.cross_shard;
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(*tx_hash);
             return vec![Action::EmitTransactionStatus {
                 tx_hash: *tx_hash,
                 status: TransactionStatus::Completed(decision),
                 added_at,
+                cross_shard,
             }];
         }
         vec![]
@@ -843,6 +880,7 @@ impl MempoolState {
                 let was_holding = entry.status.holds_state_lock();
                 let will_hold = new_status.holds_state_lock();
                 let tx = Arc::clone(&entry.tx);
+                let cross_shard = entry.cross_shard;
 
                 if !was_holding && will_hold {
                     // Acquiring lock
@@ -860,6 +898,7 @@ impl MempoolState {
                     tx_hash: *tx_hash,
                     status: new_status,
                     added_at,
+                    cross_shard,
                 }];
             }
 

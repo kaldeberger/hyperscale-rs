@@ -1822,18 +1822,15 @@ impl ProductionRunner {
                 tx_hash,
                 status,
                 added_at,
+                cross_shard,
             } => {
-                tracing::debug!(?tx_hash, ?status, "Transaction status update");
+                tracing::debug!(?tx_hash, ?status, cross_shard, "Transaction status update");
 
                 // Record transaction metrics for terminal states
                 if status.is_final() {
                     // Calculate latency from submission to finalization
                     let now = self.state.now();
                     let latency_secs = now.saturating_sub(added_at).as_secs_f64();
-                    // Check if cross-shard by looking at the transaction in mempool
-                    // For simplicity, we use false here - proper cross-shard detection
-                    // would require access to the transaction's shard list
-                    let cross_shard = false;
                     crate::metrics::record_transaction_finalized(latency_secs, cross_shard);
                 }
 

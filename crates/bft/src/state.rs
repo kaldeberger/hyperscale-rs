@@ -3248,8 +3248,7 @@ impl BftState {
         if pending_cleared > 0 {
             debug!(
                 height,
-                pending_cleared,
-                "Cleared pending vote verifications for height during view change"
+                pending_cleared, "Cleared pending vote verifications for height during view change"
             );
         }
 

@@ -781,15 +781,19 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
 
     // Automatic TCP fallback: if listening on QUIC/UDP, also listen on TCP on same port
     if config.listen_addr.contains("/udp/") && config.listen_addr.contains("/quic-v1") {
-        let tcp_addr_str = config.listen_addr
+        let tcp_addr_str = config
+            .listen_addr
             .replace("/udp/", "/tcp/")
             .replace("/quic-v1", "");
-        
+
         if let Ok(tcp_addr) = tcp_addr_str.parse::<libp2p::Multiaddr>() {
             info!("Enabled TCP fallback listener on {}", tcp_addr);
             listen_addresses.push(tcp_addr);
         } else {
-            warn!("Failed to derive TCP fallback address from {}", config.listen_addr);
+            warn!(
+                "Failed to derive TCP fallback address from {}",
+                config.listen_addr
+            );
         }
     }
 

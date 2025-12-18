@@ -112,16 +112,12 @@ impl CertificateTracker {
             return None;
         }
 
-        // Verify all shards agree on merkle root
-        let merkle_roots: Vec<_> = self
-            .certificates
-            .values()
-            .map(|c| c.outputs_merkle_root)
-            .collect();
-        if !merkle_roots.windows(2).all(|w| w[0] == w[1]) {
+        // Verify all shards agree on merkle root (zero-allocation iterator approach)
+        let mut roots_iter = self.certificates.values().map(|c| c.outputs_merkle_root);
+        let first_root = roots_iter.next()?; // Safe: is_complete() guarantees at least one
+        if !roots_iter.all(|r| r == first_root) {
             tracing::warn!(
                 tx_hash = ?self.tx_hash,
-                roots = ?merkle_roots,
                 "Merkle root mismatch across shards - cannot create TX certificate"
             );
             return None;

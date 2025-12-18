@@ -48,6 +48,18 @@ use crate::pending::{
 };
 use crate::trackers::{CertificateTracker, ProvisioningTracker, VoteTracker};
 
+/// Key type for the pending verifications reverse index.
+/// Identifies which type of verification and the secondary key (validator or shard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PendingVerificationKey {
+    /// Pending provision verification for a validator.
+    Provision(ValidatorId),
+    /// Pending vote verification for a validator.
+    Vote(ValidatorId),
+    /// Pending certificate verification for a shard.
+    Certificate(ShardGroupId),
+}
+
 /// Cached result from speculative execution.
 ///
 /// Stored when a block is proposed but before it commits. If the block commits
@@ -158,12 +170,20 @@ pub struct ExecutionState {
     /// Maps tx_hash -> PendingFetchedCertificateVerification
     pending_fetched_cert_verifications: HashMap<Hash, PendingFetchedCertificateVerification>,
 
+    /// Reverse index: tx_hash -> set of pending verification keys.
+    /// Enables O(k) cleanup instead of O(n) where k = verifications for this tx, n = total.
+    pending_verifications_by_tx: HashMap<Hash, HashSet<PendingVerificationKey>>,
+
     /// Cache of already-verified state vote signatures.
     /// Maps (tx_hash, validator_id) -> height when verified.
     /// When we see the same vote again (e.g., during gossiping or retries),
     /// we can skip re-verification and proceed directly to vote aggregation.
     /// The height is stored to enable cleanup of old entries after finalization.
     verified_state_votes: HashMap<(Hash, ValidatorId), u64>,
+
+    /// Reverse index: tx_hash -> set of validator IDs with verified votes.
+    /// Enables O(k) cleanup instead of O(n) where k = verified votes for this tx.
+    verified_votes_by_tx: HashMap<Hash, HashSet<ValidatorId>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution State
@@ -274,7 +294,9 @@ impl ExecutionState {
             pending_vote_verifications: HashMap::new(),
             pending_cert_verifications: HashMap::new(),
             pending_fetched_cert_verifications: HashMap::new(),
+            pending_verifications_by_tx: HashMap::new(),
             verified_state_votes: HashMap::new(),
+            verified_votes_by_tx: HashMap::new(),
             speculative_results: HashMap::new(),
             speculative_in_flight_txs: HashSet::new(),
             speculative_reads_index: HashMap::new(),
@@ -887,6 +909,11 @@ impl ExecutionState {
                 provision: provision.clone(),
             },
         );
+        // Update reverse index for O(k) cleanup
+        self.pending_verifications_by_tx
+            .entry(tx_hash)
+            .or_default()
+            .insert(PendingVerificationKey::Provision(validator_id));
 
         // Delegate signature verification to runner
         vec![Action::VerifyProvisionSignature {
@@ -905,9 +932,12 @@ impl ExecutionState {
         let tx_hash = provision.transaction_hash;
         let validator_id = provision.validator_id;
 
-        // Remove from pending
+        // Remove from pending and reverse index
         self.pending_provision_verifications
             .remove(&(tx_hash, validator_id));
+        if let Some(keys) = self.pending_verifications_by_tx.get_mut(&tx_hash) {
+            keys.remove(&PendingVerificationKey::Provision(validator_id));
+        }
 
         if !valid {
             tracing::warn!(
@@ -1135,6 +1165,11 @@ impl ExecutionState {
                 voting_power,
             },
         );
+        // Update reverse index for O(k) cleanup
+        self.pending_verifications_by_tx
+            .entry(tx_hash)
+            .or_default()
+            .insert(PendingVerificationKey::Vote(validator_id));
 
         // Delegate signature verification to runner
         vec![Action::VerifyStateVoteSignature { vote, public_key }]
@@ -1164,6 +1199,10 @@ impl ExecutionState {
             );
             return vec![];
         };
+        // Update reverse index
+        if let Some(keys) = self.pending_verifications_by_tx.get_mut(&tx_hash) {
+            keys.remove(&PendingVerificationKey::Vote(validator_id));
+        }
 
         if !valid {
             tracing::warn!(
@@ -1178,6 +1217,11 @@ impl ExecutionState {
         // (e.g., during gossiping or retries). We use 0 as a placeholder height
         // since cleanup is done by tx_hash in cleanup_transaction().
         self.verified_state_votes.insert((tx_hash, validator_id), 0);
+        // Update reverse index for O(k) cleanup
+        self.verified_votes_by_tx
+            .entry(tx_hash)
+            .or_default()
+            .insert(validator_id);
         tracing::trace!(
             tx_hash = ?tx_hash,
             validator = validator_id.0,
@@ -1211,7 +1255,12 @@ impl ExecutionState {
         tracker.add_vote(vote, voting_power);
 
         // Check for quorum
-        if let Some((merkle_root, votes, total_power)) = tracker.check_quorum() {
+        if let Some((merkle_root, total_power)) = tracker.check_quorum() {
+            // Extract data from tracker - use take_votes_for_root to avoid cloning
+            let votes = tracker.take_votes_for_root(&merkle_root);
+            let read_nodes = tracker.read_nodes().to_vec();
+            let participating_shards = tracker.participating_shards().to_vec();
+
             tracing::debug!(
                 tx_hash = ?tx_hash,
                 shard = local_shard.0,
@@ -1220,10 +1269,6 @@ impl ExecutionState {
                 power = total_power,
                 "Vote quorum reached"
             );
-
-            // Extract data from tracker before releasing borrow
-            let read_nodes = tracker.read_nodes().to_vec();
-            let participating_shards = tracker.participating_shards().to_vec();
 
             // Create state certificate
             let certificate =
@@ -1366,6 +1411,11 @@ impl ExecutionState {
                 certificate: cert.clone(),
             },
         );
+        // Update reverse index for O(k) cleanup
+        self.pending_verifications_by_tx
+            .entry(tx_hash)
+            .or_default()
+            .insert(PendingVerificationKey::Certificate(shard));
 
         // Delegate signature verification to runner
         vec![Action::VerifyStateCertificateSignature {
@@ -1398,6 +1448,10 @@ impl ExecutionState {
 
         // Otherwise, it's a gossiped certificate for 2PC flow
         self.pending_cert_verifications.remove(&(tx_hash, shard));
+        // Update reverse index
+        if let Some(keys) = self.pending_verifications_by_tx.get_mut(&tx_hash) {
+            keys.remove(&PendingVerificationKey::Certificate(shard));
+        }
 
         if !valid {
             tracing::warn!(
@@ -1513,9 +1567,7 @@ impl ExecutionState {
         );
 
         // Emit verification action for each embedded StateCertificate
-        for (shard_id, proof) in &certificate.shard_proofs {
-            let state_cert = &proof.state_certificate;
-
+        for (shard_id, state_cert) in &certificate.shard_proofs {
             // Get public keys for this shard's committee
             let committee = self.topology.committee_for_shard(*shard_id);
             let public_keys: Vec<PublicKey> = committee
@@ -1639,8 +1691,12 @@ impl ExecutionState {
         &mut self,
         tx_hash: &Hash,
     ) -> Option<Arc<TransactionCertificate>> {
-        // Clean up verified vote cache for this transaction
-        self.verified_state_votes.retain(|(h, _), _| h != tx_hash);
+        // Clean up verified vote cache using reverse index for O(k) instead of O(n)
+        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
+            for vid in validators {
+                self.verified_state_votes.remove(&(*tx_hash, vid));
+            }
+        }
 
         self.finalized_certificates.remove(tx_hash)
     }
@@ -1739,16 +1795,30 @@ impl ExecutionState {
         self.early_votes.remove(tx_hash);
         self.early_certificates.remove(tx_hash);
 
-        // Pending verifications cleanup (need to iterate since key is (tx_hash, _))
-        self.pending_provision_verifications
-            .retain(|(h, _), _| h != tx_hash);
-        self.pending_vote_verifications
-            .retain(|(h, _), _| h != tx_hash);
-        self.pending_cert_verifications
-            .retain(|(h, _), _| h != tx_hash);
+        // Pending verifications cleanup using reverse index for O(k) instead of O(n)
+        if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
+            for key in keys {
+                match key {
+                    PendingVerificationKey::Provision(vid) => {
+                        self.pending_provision_verifications
+                            .remove(&(*tx_hash, vid));
+                    }
+                    PendingVerificationKey::Vote(vid) => {
+                        self.pending_vote_verifications.remove(&(*tx_hash, vid));
+                    }
+                    PendingVerificationKey::Certificate(shard) => {
+                        self.pending_cert_verifications.remove(&(*tx_hash, shard));
+                    }
+                }
+            }
+        }
 
-        // Verified vote cache cleanup
-        self.verified_state_votes.retain(|(h, _), _| h != tx_hash);
+        // Verified vote cache cleanup using reverse index for O(k) instead of O(n)
+        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
+            for vid in validators {
+                self.verified_state_votes.remove(&(*tx_hash, vid));
+            }
+        }
 
         tracing::debug!(
             tx_hash = %tx_hash,
@@ -1772,23 +1842,30 @@ impl ExecutionState {
         // Clean up pending fetched certificate verifications for this tx
         self.pending_fetched_cert_verifications.remove(tx_hash);
 
-        // Clean up pending cert verifications (gossiped StateCertificates)
-        let removed_verifications = self
-            .pending_cert_verifications
-            .keys()
-            .filter(|(h, _)| h == tx_hash)
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in &removed_verifications {
-            self.pending_cert_verifications.remove(key);
+        // Clean up pending cert verifications using reverse index
+        let mut removed_count = 0;
+        if let Some(keys) = self.pending_verifications_by_tx.get_mut(tx_hash) {
+            // Only remove Certificate keys, keep Provision and Vote keys
+            let cert_keys: Vec<_> = keys
+                .iter()
+                .filter_map(|k| match k {
+                    PendingVerificationKey::Certificate(shard) => Some(*shard),
+                    _ => None,
+                })
+                .collect();
+            for shard in cert_keys {
+                self.pending_cert_verifications.remove(&(*tx_hash, shard));
+                keys.remove(&PendingVerificationKey::Certificate(shard));
+                removed_count += 1;
+            }
         }
 
-        if had_tracker || had_early || !removed_verifications.is_empty() {
+        if had_tracker || had_early || removed_count > 0 {
             tracing::debug!(
                 tx_hash = %tx_hash,
                 had_tracker = had_tracker,
                 had_early = had_early,
-                removed_verifications = removed_verifications.len(),
+                removed_verifications = removed_count,
                 "Cancelled local certificate building - using fetched certificate"
             );
         }
@@ -2059,7 +2136,7 @@ impl ExecutionState {
         let written_nodes: HashSet<NodeId> = certificate
             .shard_proofs
             .values()
-            .flat_map(|proof| proof.state_writes.iter().map(|w| w.node_id))
+            .flat_map(|cert| cert.state_writes.iter().map(|w| w.node_id))
             .collect();
 
         if written_nodes.is_empty() {

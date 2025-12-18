@@ -192,6 +192,14 @@ pub struct BftState {
     /// When we receive a synced block, we must verify its QC's signature before applying.
     pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification>,
 
+    /// Cache of already-verified QC signatures.
+    /// Maps QC's block_hash (the block the QC certifies) -> height.
+    /// When we see the same QC in multiple block headers (e.g., during view changes
+    /// where multiple proposals at the same height share the same parent_qc), we can
+    /// skip re-verification and proceed directly to voting.
+    /// The height is stored to enable cleanup of old entries.
+    verified_qcs: HashMap<Hash, u64>,
+
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
     /// Maps height -> (Block, QC).
     /// When we receive a synced block for height N but we're still waiting for earlier
@@ -293,6 +301,7 @@ impl BftState {
             pending_vote_verifications: HashMap::new(),
             pending_qc_verifications: HashMap::new(),
             pending_synced_block_verifications: HashMap::new(),
+            verified_qcs: HashMap::new(),
             buffered_synced_blocks: std::collections::BTreeMap::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
@@ -1292,6 +1301,19 @@ impl BftState {
         // This is CRITICAL for BFT safety - prevents Byzantine proposers from
         // including fake QCs with invalid signatures.
         if !header.parent_qc.is_genesis() {
+            // Check if we've already verified this exact QC (by its block_hash).
+            // This happens during view changes when multiple proposals at the same
+            // height share the same parent_qc. Avoids redundant crypto work.
+            let qc_block_hash = header.parent_qc.block_hash;
+            if self.verified_qcs.contains_key(&qc_block_hash) {
+                trace!(
+                    qc_block_hash = ?qc_block_hash,
+                    block_hash = ?block_hash,
+                    "QC already verified, skipping re-verification"
+                );
+                return self.try_vote_on_block(block_hash, height, round);
+            }
+
             // Check if we already have pending verification for this block
             if self.pending_qc_verifications.contains_key(&block_hash) {
                 trace!("QC verification already pending for block {}", block_hash);
@@ -1882,6 +1904,17 @@ impl BftState {
             block_hash = ?block_hash,
             height = pending.header.height.0,
             "QC signature verified successfully, proceeding to vote"
+        );
+
+        // Cache the verified QC so we don't re-verify it for other blocks
+        // with the same parent_qc (e.g., during view changes).
+        let qc_block_hash = pending.header.parent_qc.block_hash;
+        let qc_height = pending.header.parent_qc.height.0;
+        self.verified_qcs.insert(qc_block_hash, qc_height);
+        trace!(
+            qc_block_hash = ?qc_block_hash,
+            qc_height = qc_height,
+            "Cached verified QC"
         );
 
         // QC is valid - proceed to vote on the block
@@ -3386,6 +3419,12 @@ impl BftState {
         // pending verification since we won't need it.
         self.pending_qc_verifications
             .retain(|hash, _| self.pending_blocks.contains_key(hash));
+
+        // Remove verified QC cache entries for heights at or below committed height.
+        // We keep entries slightly above committed_height in case of view changes
+        // where multiple proposals at the same height share the same parent_qc.
+        self.verified_qcs
+            .retain(|_, height| *height > committed_height.saturating_sub(2));
     }
 
     /// Clean up stale incomplete pending blocks.
@@ -6190,6 +6229,130 @@ mod tests {
         assert!(
             has_block_header,
             "Should propose immediately after QC formation when has deferrals"
+        );
+    }
+
+    #[test]
+    fn test_qc_verification_caching_skips_redundant_verification() {
+        // Test that when we see the same QC in multiple block headers (e.g., during
+        // view changes), we only verify it once and skip re-verification for subsequent blocks.
+        use hyperscale_core::Action;
+        use hyperscale_types::SignerBitfield;
+
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let mut state = BftState::new(
+            1,
+            keys[0].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
+
+        state.set_time(Duration::from_secs(100));
+
+        // Set committed_height to 1 so we don't trigger sync
+        let parent_hash = Hash::from_bytes(b"parent_block");
+        state.committed_height = 1;
+        state.committed_hash = parent_hash;
+
+        // Create a parent QC that will be shared by multiple blocks
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+
+        let parent_qc = QuorumCertificate {
+            block_hash: parent_hash,
+            height: BlockHeight(1),
+            parent_block_hash: Hash::ZERO,
+            round: 0,
+            aggregated_signature: Signature::zero(),
+            signers: signers.clone(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 99_000,
+        };
+
+        // First block at height 2, round 0
+        let header1 = BlockHeader {
+            height: BlockHeight(2),
+            parent_hash,
+            parent_qc: parent_qc.clone(),
+            proposer: ValidatorId(2), // height 2, round 0 -> validator 2
+            timestamp: 100_000,
+            round: 0,
+            is_fallback: false,
+        };
+
+        // Process first block header
+        let actions1 = state.on_block_header(
+            header1,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Should emit VerifyQcSignature for the first block
+        let has_verify_qc1 = actions1
+            .iter()
+            .any(|a| matches!(a, Action::VerifyQcSignature { .. }));
+        assert!(has_verify_qc1, "First block should trigger QC verification");
+
+        // Simulate QC verification success by directly inserting into the cache.
+        // In real operation, this happens in on_qc_signature_verified when valid=true.
+        state.verified_qcs.insert(parent_hash, 1);
+
+        // Second block at height 2, round 1 (same parent QC - view change scenario)
+        let header2 = BlockHeader {
+            height: BlockHeight(2),
+            parent_hash,
+            parent_qc: parent_qc.clone(),
+            proposer: ValidatorId(3), // height 2, round 1 -> validator 3
+            timestamp: 100_001,
+            round: 1,
+            is_fallback: false,
+        };
+
+        // Process second block header
+        let actions2 = state.on_block_header(
+            header2,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Should NOT emit VerifyQcSignature since QC is already verified
+        let has_verify_qc2 = actions2
+            .iter()
+            .any(|a| matches!(a, Action::VerifyQcSignature { .. }));
+        assert!(
+            !has_verify_qc2,
+            "Second block with same parent QC should skip verification"
+        );
+
+        // Should emit vote-related actions instead (broadcast)
+        let has_broadcast = actions2
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastToShard { .. }));
+        assert!(
+            has_broadcast,
+            "Should proceed directly to voting when QC already verified"
         );
     }
 }
